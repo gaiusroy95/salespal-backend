@@ -1,0 +1,59 @@
+{
+  "name": "salespal-backend",
+  "version": "1.0.0",
+  "description": "Sales-Pal Backend — Complete Express + PostgreSQL API replacing Supabase, deployed to Google Cloud Run",
+  "main": "server.js",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node server.js",
+    "migrate": "node src/db/migrate.js",
+    "promote-admin": "node promote_user_to_admin.js",
+    "test": "echo \"No tests yet\"",
+    "docker:build": "docker build -t salespal-backend .",
+    "docker:run": "docker run -p 8080:8080 --env-file .env --name salespal-backend salespal-backend"
+  },
+  "keywords": [
+    "salespal",
+    "saas",
+    "backend",
+    "express",
+    "postgres"
+  ],
+  "author": "BLACKBOXAI",
+  "license": "ISC",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "dependencies": {
+    "@google-cloud/vertexai": "^1.11.0",
+    "@google/genai": "^1.48.0",
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.6",
+    "bcrypt": "^5.1.1",
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "csv-parse": "^5.6.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "express-validator": "^7.2.0",
+    "google-ads-api": "^23.0.0",
+    "google-auth-library": "^9.14.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.4",
+    "pdfkit": "^0.18.0",
+    "pg": "^8.13.0",
+    "playwright": "^1.59.1",
+    "razorpay": "^2.9.6",
+    "winston": "^3.14.2",
+    "xlsx": "^0.18.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}

@@ -1,0 +1,37 @@
+node_modules/
+dist/
+build/
+coverage/
+.nyc_output/
+
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+.pnp
+.pnp.js
+
+# Credentials
+service-account.json
+env.yaml
+
+# Local / generated artifacts (do not commit).
+*.exe
+*_output.txt
+proxy_*.txt
+gcloud_*.txt
+migration_log.txt

@@ -104,12 +104,13 @@ function intentTierFromDbLead(row) {
   return { tier: 'Warm', label: 'Default' };
 }
 
-async function fetchLeadCrmContextForVoice({ leadId, orgId }) {
-  if (!leadId || !orgId) return { block: '', intent: null, row: null };
+async function fetchLeadCrmContextForVoice({ leadId, orgId: _ignoredOrg }) {
+  if (!leadId) return { block: '', intent: null, row: null };
+  /** Bind by lead id only — JWT org can disagree with leads.org_id; session must already authorize this lead. */
   const { rows } = await db.query(
-    `SELECT contact_first_name, contact_last_name, contact_phone, stage, priority, ai_score, notes, company_name, source, metadata
-     FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`,
-    [leadId, orgId]
+    `SELECT contact_first_name, contact_last_name, contact_phone, stage, priority, ai_score, notes, company_name, source, metadata, org_id
+     FROM leads WHERE id = $1 LIMIT 1`,
+    [leadId]
   );
   const r = rows[0];
   if (!r) return { block: '', intent: null, row: null };
@@ -411,13 +412,19 @@ function isProjectFactQuestion(text) {
   );
 }
 
-async function fetchProjectKnowledgeContext({ orgId, projectId, queryText }) {
-  if (!orgId || !projectId) return [];
+async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, userId }) {
+  const access = await resolveBrainDriveOrgForVoice({
+    projectId,
+    leadId: leadId || null,
+    userId: userId || null,
+  });
+  const kbOrgId = access?.knowledgeOrgId;
+  if (!kbOrgId || !projectId) return [];
   const { rows } = await db.query(
     `SELECT source_type, source_name, content, embedding
      FROM project_knowledge
      WHERE org_id = $1 AND project_id = $2`,
-    [orgId, projectId]
+    [kbOrgId, projectId]
   );
   if (!rows.length) return [];
   const q = String(queryText || '').trim() || 'project overview';
@@ -436,6 +443,19 @@ async function fetchProjectRecordForVoice({ orgId, projectId }) {
   return rows[0] || null;
 }
 
+/** Load listing row by id only (canonical org lives on projects.org_id — Brain Drive keys match that). */
+async function fetchProjectRecordById(projectId) {
+  if (!projectId) return null;
+  const { rows } = await db.query(
+    `SELECT id, org_id, name, description, industry, metadata
+     FROM projects
+     WHERE id = $1
+     LIMIT 1`,
+    [projectId]
+  );
+  return rows[0] || null;
+}
+
 async function fetchAllProjectKnowledgeRows({ orgId, projectId }) {
   if (!orgId || !projectId) return [];
   const { rows } = await db.query(
@@ -447,16 +467,71 @@ async function fetchAllProjectKnowledgeRows({ orgId, projectId }) {
   return rows;
 }
 
+/**
+ * Brain Drive rows are keyed by projects.org_id. Reps/leads sometimes resolve a different org_id.
+ * Resolve the project's canonical org after a lightweight access check vs the lead tag.
+ */
+async function resolveBrainDriveOrgForVoice({ projectId, leadId, userId }) {
+  if (!projectId) return null;
+  const project = await fetchProjectRecordById(projectId);
+  if (!project?.org_id) return null;
+
+  if (!leadId) {
+    return { knowledgeOrgId: project.org_id, project };
+  }
+
+  const { rows: lrows } = await db.query(
+    `SELECT id, org_id, user_id, metadata FROM leads WHERE id = $1 LIMIT 1`,
+    [leadId]
+  );
+  const lead = lrows[0];
+  if (!lead) return null;
+
+  const meta = lead.metadata && typeof lead.metadata === 'object' ? lead.metadata : {};
+  const tagged =
+    Boolean(meta.projectId && String(meta.projectId) === String(projectId)) ||
+    Boolean(meta.project_id && String(meta.project_id) === String(projectId));
+
+  const leadOrg = lead.org_id || null;
+  const projOrg = project.org_id;
+  const sameOrg =
+    leadOrg === null ||
+    projOrg === null ||
+    String(leadOrg) === String(projOrg);
+
+  const callerOwnsLead =
+    userId &&
+    lead.user_id != null &&
+    String(lead.user_id) === String(userId);
+
+  if (!(sameOrg || tagged || callerOwnsLead)) {
+    console.warn('[aiRuntime] Brain Drive org gate: lead/project mismatch', {
+      leadId,
+      projectId,
+    });
+    return null;
+  }
+
+  return { knowledgeOrgId: project.org_id, project };
+}
+
 /** Rich baseline used for opener + persisted on session for consistent project-centric discussion */
-async function buildVoiceProjectDiscussionBrief({ orgId, projectId }) {
-  const project = await fetchProjectRecordForVoice({ orgId, projectId });
-  if (!project) {
+async function buildVoiceProjectDiscussionBrief({ orgId: _fallbackOrgId, projectId, leadId, userId }) {
+  const access = await resolveBrainDriveOrgForVoice({
+    projectId,
+    leadId: leadId || null,
+    userId: userId || null,
+  });
+  if (!access?.knowledgeOrgId || !access.project) {
     return {
       brief: '',
       displayName: null,
       hasKnowledge: false,
     };
   }
+
+  const { knowledgeOrgId, project } = access;
+
   const pname = String(project.name || '').trim() || 'this project';
   const desc = String(project.description || '').trim().slice(0, 900);
   const industry = project.industry ? String(project.industry).trim() : '';
@@ -464,7 +539,7 @@ async function buildVoiceProjectDiscussionBrief({ orgId, projectId }) {
   if (industry) lines.push(`Category / industry hint: ${industry}`);
   if (desc) lines.push(`Recorded description:\n${desc}`);
 
-  const knowledgeRows = await fetchAllProjectKnowledgeRows({ orgId, projectId });
+  const knowledgeRows = await fetchAllProjectKnowledgeRows({ orgId: knowledgeOrgId, projectId });
   if (!knowledgeRows.length) {
     return {
       brief: lines.join('\n'),
@@ -558,9 +633,14 @@ async function createVoiceSession({
   let voiceProjectBrief = '';
   let voiceProjectName = null;
   let voiceProjectHasKnowledge = false;
-  if (projectId && orgId) {
+  if (projectId) {
     try {
-      const vp = await buildVoiceProjectDiscussionBrief({ orgId, projectId });
+      const vp = await buildVoiceProjectDiscussionBrief({
+        orgId,
+        projectId,
+        leadId: leadId || null,
+        userId: userId || null,
+      });
       voiceProjectBrief = String(vp.brief || '').trim();
       voiceProjectName = vp.displayName || null;
       voiceProjectHasKnowledge = Boolean(vp.hasKnowledge);
@@ -576,7 +656,7 @@ async function createVoiceSession({
     voiceProjectHasKnowledge,
   };
   let mergedOpenerContext = String(openerContext || '').trim();
-  if (leadId && orgId) {
+  if (leadId) {
     try {
       const { block } = await fetchLeadCrmContextForVoice({ leadId, orgId });
       if (block) {
@@ -675,11 +755,16 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
 
   const effectiveOrgForProject = row.org_id || orgId;
   const hydrateFailed = Boolean(md.voiceProjectHydrateFailed);
-  if (projectId && effectiveOrgForProject && userId && !voiceProjectName && !hydrateFailed) {
+  const thinVoiceBrain =
+    !String(voiceProjectName || '').trim() || !String(voiceProjectBrief || '').trim();
+
+  if (projectId && row.lead_id && userId && !hydrateFailed && thinVoiceBrain) {
     try {
       const vp = await buildVoiceProjectDiscussionBrief({
         orgId: effectiveOrgForProject,
         projectId,
+        leadId: row.lead_id,
+        userId,
       });
       if (vp.displayName || vp.brief) {
         voiceProjectBrief = String(vp.brief || '').trim();
@@ -690,6 +775,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
             voiceProjectBrief,
             voiceProjectName,
             voiceProjectHasKnowledge: Boolean(vp.hasKnowledge),
+            voiceProjectHydrateFailed: false,
           },
           { orgId, userId }
         );
@@ -723,9 +809,10 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   }
 
   const topKnowledge = await fetchProjectKnowledgeContext({
-    orgId: row.org_id || orgId,
     projectId,
     queryText: text,
+    leadId: row.lead_id || null,
+    userId,
   });
   const asksProjectFacts = isProjectFactQuestion(text);
 

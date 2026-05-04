@@ -1,10 +1,16 @@
 const { Router } = require('express');
+const multer = require('multer');
 const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const { aiLimiter, voiceTtsLimiter } = require('../middleware/rateLimiter');
 const ctrl = require('../controllers/ai.controller');
 
 const router = Router();
+
+const voiceSttUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 },
+});
 
 router.post(
   '/chat',
@@ -28,6 +34,7 @@ router.post(
   validate,
   ctrl.voiceTts
 );
+router.post('/voice/stt', voiceTtsLimiter, voiceSttUpload.single('audio'), ctrl.voiceSttTranscribe);
 router.post(
   '/voice/session/start',
   aiLimiter,

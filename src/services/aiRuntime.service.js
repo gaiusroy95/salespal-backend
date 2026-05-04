@@ -505,14 +505,37 @@ async function buildVoiceProjectDiscussionBrief({ orgId, projectId }) {
 }
 
 function resolveVoiceTtsForClient() {
-  const want = String(env.integrations?.voiceTtsProvider || 'browser').toLowerCase();
+  const want = String(env.integrations?.voiceTtsProvider || 'auto').trim().toLowerCase();
   const sarvamOk = sarvamService.isSarvamTtsConfigured(env);
-  const provider = want === 'sarvam' && sarvamOk ? 'sarvam' : 'browser';
+  /** auto (default): use Sarvam whenever API key is set; explicit browser skips Sarvam. */
+  let provider = 'browser';
+  if (want === 'browser') {
+    provider = 'browser';
+  } else if (sarvamOk && (want === 'auto' || want === '' || want === 'sarvam')) {
+    provider = 'sarvam';
+  }
   return {
     provider,
     sarvam_configured: sarvamOk,
     requested_provider: want,
     mime_type_hint: provider === 'sarvam' ? 'audio/wav' : null,
+  };
+}
+
+/** STT: Sarvam REST when key + auto/sarvam; else browser Web Speech API. */
+function resolveVoiceSttForClient() {
+  const want = String(env.integrations?.voiceSttProvider || 'auto').trim().toLowerCase();
+  const sarvamOk = sarvamService.isSarvamTtsConfigured(env);
+  let provider = 'browser';
+  if (want === 'browser') {
+    provider = 'browser';
+  } else if (sarvamOk && (want === 'auto' || want === '' || want === 'sarvam')) {
+    provider = 'sarvam';
+  }
+  return {
+    provider,
+    sarvam_configured: sarvamOk,
+    requested_provider: want,
   };
 }
 
@@ -618,6 +641,7 @@ async function createVoiceSession({
     opener,
     telephony,
     voice_tts: resolveVoiceTtsForClient(),
+    voice_stt: resolveVoiceSttForClient(),
   };
 }
 
@@ -645,9 +669,46 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   const md = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
   const projectId = md.projectId || null;
   const voicePersona = String(md.voicePersona || '').trim().toLowerCase();
-  const voiceProjectBrief = String(md.voiceProjectBrief || '').trim();
-  const voiceProjectName = String(md.voiceProjectName || '').trim();
+  let voiceProjectBrief = String(md.voiceProjectBrief || '').trim();
+  let voiceProjectName = String(md.voiceProjectName || '').trim();
   const agentName = normalizeAgentName(md.agentName || 'SalesPal AI');
+
+  const effectiveOrgForProject = row.org_id || orgId;
+  const hydrateFailed = Boolean(md.voiceProjectHydrateFailed);
+  if (projectId && effectiveOrgForProject && userId && !voiceProjectName && !hydrateFailed) {
+    try {
+      const vp = await buildVoiceProjectDiscussionBrief({
+        orgId: effectiveOrgForProject,
+        projectId,
+      });
+      if (vp.displayName || vp.brief) {
+        voiceProjectBrief = String(vp.brief || '').trim();
+        voiceProjectName = String(vp.displayName || '').trim();
+        await mergeVoiceSessionMetadata(
+          conversationId,
+          {
+            voiceProjectBrief,
+            voiceProjectName,
+            voiceProjectHasKnowledge: Boolean(vp.hasKnowledge),
+          },
+          { orgId, userId }
+        );
+      } else {
+        await mergeVoiceSessionMetadata(
+          conversationId,
+          { voiceProjectHydrateFailed: true },
+          { orgId, userId }
+        );
+      }
+    } catch (e) {
+      console.warn('[aiRuntime] Voice project sticky refresh skipped:', e.message);
+      await mergeVoiceSessionMetadata(
+        conversationId,
+        { voiceProjectHydrateFailed: true },
+        { orgId, userId }
+      ).catch(() => {});
+    }
+  }
 
   let crmBlock = '';
   let crmIntentTier = 'Warm';
@@ -699,9 +760,14 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
       ? `ROLE — SENIOR AI SUPERVISOR (Male executive voice profile):\n- You have taken over from the front-line bot. Tone: calm, decisive, respectful authority — never rude.\n- Still mirror exactly the languages / scripts used in the lead's **last utterance**, including Hindi, Tamil, Telugu, Marathi, Bengali, Gujarati, Kannada, Malayalam, Urdu/Punjabi, Arabic, English — and natural Hinglish / code-switching.\n- De-escalate complex objections; summarise trade-offs crisply.\n- Offer an **organic human manager** ONLY if they clearly insist twice that they will not continue with AI.\n\n`
       : '';
 
+  const listingLabel = voiceProjectName || (projectId ? `project ${projectId}` : '');
+  const projectMandatoryBlock = projectId
+    ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nPRIMARY SUBJECT (NON-NEGOTIABLE)\n- This Tata / SalesPal voice session exists ONLY to sell and qualify interest in: **"${listingLabel}"**.\n- You MUST name this listing explicitly when it helps clarity and keep substance tied to location fit, pricing band, timelines, inventory, amenities, paperwork, visit — for THIS listing only.\n- Do **not** treat this as a generic customer-service call.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`
+    : '';
+
   const voiceSystem = `You are on a live phone-style sales call with a lead (SalesPal).
 
-${crmBlock}${personaSupervisorBlock}
+${projectMandatoryBlock}${crmBlock}${personaSupervisorBlock}
 INTENT & CLASSIFICATION:
 - CRM currently labels this lead as **${crmIntentTier}** (Hot / Warm / Cold). Use the live conversation to validate or adjust mentally.
 - When the conversation is winding down or the lead says goodbye, include **one clear spoken sentence** that states your assessment, e.g. "Based on our chat I would mark you as a warm lead today because …" (use Hot/Warm/Cold and a real reason — no jargon about "CRM").

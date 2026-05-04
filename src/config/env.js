@@ -135,8 +135,15 @@ const envSchema = z.object({
   SARVAM_TTS_SPEAKER: z.string().optional().default(''),
   SARVAM_TARGET_LANGUAGE_CODE: z.string().optional().default(''),
   SARVAM_TTS_PACE: z.string().optional().default(''),
-  /** browser | sarvam — playback engine for AI voice replies in SPA. */
-  VOICE_TTS_PROVIDER: z.string().optional().default('browser'),
+  /** auto (Sarvam if key set) | sarvam | browser */
+  VOICE_TTS_PROVIDER: z.string().optional().default('auto'),
+  SARVAM_STT_URL: z.string().optional().default(''),
+  /** saaras:v3 (recommended) | saarika:v2.5 */
+  SARVAM_STT_MODEL: z.string().optional().default('saaras:v3'),
+  /** Mode when using saaras:v3: transcribe | translate | verbatim | translit | codemix */
+  SARVAM_STT_MODE: z.string().optional().default('codemix'),
+  /** auto (Sarvam if key set) | sarvam | browser (Web Speech API) */
+  VOICE_STT_PROVIDER: z.string().optional().default('auto'),
 });
 
 const parsed = envSchema.parse(process.env);
@@ -228,7 +235,11 @@ const env = {
     sarvamDefaultLanguage: String(parsed.SARVAM_TARGET_LANGUAGE_CODE || '').trim(),
     sarvamPace:
       parsed.SARVAM_TTS_PACE === '' ? NaN : Number(parsed.SARVAM_TTS_PACE || Number.NaN),
-    voiceTtsProvider: String(parsed.VOICE_TTS_PROVIDER || 'browser').trim().toLowerCase(),
+    voiceTtsProvider: String(parsed.VOICE_TTS_PROVIDER || 'auto').trim().toLowerCase(),
+    sarvamSttUrl: String(parsed.SARVAM_STT_URL || '').trim(),
+    sarvamSttModel: String(parsed.SARVAM_STT_MODEL || 'saaras:v3').trim(),
+    sarvamSttMode: String(parsed.SARVAM_STT_MODE || 'codemix').trim(),
+    voiceSttProvider: String(parsed.VOICE_STT_PROVIDER || 'auto').trim().toLowerCase(),
   },
   telephony: {
     provider: 'tata',

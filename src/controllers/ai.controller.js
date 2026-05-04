@@ -17,6 +17,32 @@ async function getOrgId(userId) {
   return rows[0]?.org_id || null;
 }
 
+/**
+ * Many reps are not in `org_members` but leads still have `org_id`. Without this we skip project brief + RAG.
+ */
+async function resolveEffectiveOrgIdForVoice(userId, leadId, membershipOrgId) {
+  if (membershipOrgId) return membershipOrgId;
+  if (!userId || !leadId) return null;
+  try {
+    const { rows } = await db.query(
+      `SELECT l.org_id
+       FROM leads l
+       WHERE l.id = $1
+         AND (
+           l.user_id = $2::uuid
+           OR EXISTS (
+             SELECT 1 FROM org_members m WHERE m.user_id = $2::uuid AND m.org_id IS NOT DISTINCT FROM l.org_id
+           )
+         )
+       LIMIT 1`,
+      [leadId, userId]
+    );
+    return rows[0]?.org_id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function sanitizeChatHistory(history) {
   if (!Array.isArray(history)) return [];
   const out = [];
@@ -358,6 +384,33 @@ Provide:
 /**
  * Sarvam Bulbul TTS for browser playback (Gemini/Vertex = conversation brain).
  */
+async function voiceSttTranscribe(req, res, next) {
+  try {
+    if (!sarvamService.isSarvamTtsConfigured(env)) {
+      return res.status(503).json({
+        error: { code: 'SARVAM_NOT_CONFIGURED', message: 'Sarvam is not configured (SARVAM_API_SUBSCRIPTION_KEY).' },
+      });
+    }
+    const f = req.file;
+    if (!f?.buffer?.length) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'audio file is required (multipart field: audio)' },
+      });
+    }
+    const locale = String(req.body?.locale || 'hing').trim() || 'hing';
+    const out = await sarvamService.transcribeBufferedAudio({
+      env,
+      buffer: f.buffer,
+      filename: f.originalname || 'utterance.webm',
+      mimeType: f.mimetype || '',
+      locale,
+    });
+    res.json({ text: out.transcript, request_id: out.request_id });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function voiceTts(req, res, next) {
   try {
     const text = String(req.body?.text || '').trim();
@@ -388,15 +441,17 @@ async function startVoiceSession(req, res, next) {
     const effectiveBrandId = String(
       brandId || (req.user?.id ? `web-${req.user.id}` : 'web-demo')
     );
-    const orgId = req.user?.id ? await getOrgId(req.user.id) : null;
+    const membershipOrgId = req.user?.id ? await getOrgId(req.user.id) : null;
     const userId = req.user?.id || null;
+    const orgId =
+      membershipOrgId || (req.user?.id && leadId ? await resolveEffectiveOrgIdForVoice(req.user.id, leadId, null) : null);
 
     if (!phone && !leadId) {
       return res.status(400).json({
         error: { code: 'VALIDATION_ERROR', message: 'phone or leadId is required' },
       });
     }
-    const { session, opener, telephony, voice_tts } = await aiRuntime.createVoiceSession({
+    const { session, opener, telephony, voice_tts, voice_stt } = await aiRuntime.createVoiceSession({
       brandId: effectiveBrandId,
       leadId,
       phone,
@@ -419,6 +474,7 @@ async function startVoiceSession(req, res, next) {
       assistant_reply: opener,
       telephony,
       voice_tts,
+      voice_stt,
       state: session.state,
     });
   } catch (err) {
@@ -444,8 +500,11 @@ async function voiceTurn(req, res, next) {
       });
     }
     const effectiveBrandId = String(brandId || (req.user?.id ? `web-${req.user.id}` : 'web-demo'));
-    const orgId = req.user?.id ? await getOrgId(req.user.id) : null;
+    const membershipOrgId = req.user?.id ? await getOrgId(req.user.id) : null;
     const userId = req.user?.id || null;
+    const orgId =
+      membershipOrgId ||
+      (req.user?.id && leadId ? await resolveEffectiveOrgIdForVoice(req.user.id, leadId, null) : null);
     const actions = detectVoiceHandshakeActions(text);
     let supervisorPrefix = '';
 
@@ -824,6 +883,7 @@ module.exports = {
   generateAdCopy,
   startVoiceSession,
   voiceTts,
+  voiceSttTranscribe,
   voiceTurn,
   voiceHistory,
   summarizeVoice,

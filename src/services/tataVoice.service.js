@@ -33,7 +33,17 @@ function joinUrl(base, path) {
   return `${b}/${p.replace(/^\/+/, '')}`;
 }
 
-async function placeOutboundCall({ to, leadName, conversationId, opener }) {
+const OPENER_PAYLOAD_MAX_LEN = 950;
+
+async function placeOutboundCall({
+  to,
+  leadName,
+  conversationId,
+  opener,
+  projectName = null,
+  projectId = null,
+  locale = null,
+}) {
   if (!isTelephonyEnabled()) {
     return {
       enabled: false,
@@ -61,6 +71,17 @@ async function placeOutboundCall({ to, leadName, conversationId, opener }) {
   const destinationNumber = String(to || '').replace(/[^\d]/g, '');
   const agentNumber = String(env.telephony.fromNumber || '').replace(/[^\d]/g, '');
   const callerId = String(env.telephony.fromNumber || '').replace(/[^\d]/g, '');
+  const openerTrimmed = String(opener || '').trim().slice(0, OPENER_PAYLOAD_MAX_LEN);
+  const pn = projectName ? String(projectName).trim().slice(0, 240) : '';
+  const pid = projectId ? String(projectId).trim().slice(0, 120) : '';
+  /** Smartflo docs only list core click_to_call keys; partner voice stacks often read custom blobs — mirror opener under several aliases. */
+  const salespal = {
+    conversation_id: conversationId,
+    opener: openerTrimmed,
+    ...(pn ? { project_name: pn } : {}),
+    ...(pid ? { project_id: pid } : {}),
+    ...(locale ? { locale: String(locale).slice(0, 40) } : {}),
+  };
   const payload = {
     async: Number(env.telephony.asyncMode ?? 1),
     agent_number: agentNumber || undefined,
@@ -72,8 +93,15 @@ async function placeOutboundCall({ to, leadName, conversationId, opener }) {
     leadName: leadName || undefined,
     conversationId,
     webhookUrl: env.telephony.statusWebhookUrl || undefined,
+    opening_message: openerTrimmed,
+    opening_line: openerTrimmed,
+    ...(pn ? { project_name: pn, salespal_listing_name: pn } : {}),
+    ...(pid ? { salespal_project_id: pid } : {}),
+    salespal,
     ai: {
-      opener: String(opener || '').slice(0, 600),
+      opener: openerTrimmed,
+      opening_line: openerTrimmed,
+      ...(pn ? { project_listing_name: pn } : {}),
     },
   };
 

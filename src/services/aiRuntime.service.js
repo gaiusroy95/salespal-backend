@@ -398,6 +398,26 @@ async function buildContextualVoiceOpener({ locale, contactName, openerContext, 
   }
 }
 
+/** Smartflo ignores unknown JSON keys — model may omit the listing name on PSTN anyway; enforce spoken mention. */
+function ensureOpenerNamesProjectListing(opener, projectName, locale) {
+  const pn = String(projectName || '').trim();
+  const base = String(opener || '').trim();
+  if (!pn) return base || '';
+  const needle = pn.toLowerCase().slice(0, Math.min(pn.length, 48));
+  if (needle.length >= 2 && base.toLowerCase().includes(needle)) return base;
+
+  const loc = String(locale || 'hing').toLowerCase().replace(/_/g, '-');
+  let glue = '';
+  if (loc.startsWith('hi') || loc.startsWith('hing') || /^hi-?in\b/.test(loc)) {
+    glue = `Ye call ${pn} project ke baare me hai — batayein aap kya dekh rahe hain?`;
+  } else if (/^(mr|ta|te|kn|ml|gu|bn|pa)(-|)/.test(loc)) {
+    glue = `I'm reaching out specifically about ${pn}. What would help you decide on the next step?`;
+  } else {
+    glue = `I'm calling about ${pn} specifically — what's most important for you to know today?`;
+  }
+  return base ? `${glue} ${base}`.trim() : glue;
+}
+
 function normalizeAgentName(name) {
   const raw = String(name || '').trim();
   if (!raw) return 'SalesPal AI';
@@ -667,13 +687,18 @@ async function createVoiceSession({
     }
   }
 
-  const opener = await buildContextualVoiceOpener({
+  let opener = await buildContextualVoiceOpener({
     locale: locale || 'hing',
     contactName,
     openerContext: mergedOpenerContext,
     projectBrief: voiceProjectBrief,
     projectName: voiceProjectName,
   });
+
+  /** PSTN (Tata) must hear the listing name even if Gemini paraphrases it away — keep SPA + telco opener aligned. */
+  if (voiceProjectName) {
+    opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+  }
 
   await db.query(
     `INSERT INTO ai_voice_sessions (
@@ -713,6 +738,9 @@ async function createVoiceSession({
       leadName: contactName,
       conversationId,
       opener,
+      projectName: voiceProjectName || null,
+      projectId: projectId || null,
+      locale: locale || 'hing',
     });
   }
 

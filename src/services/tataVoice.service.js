@@ -1,8 +1,30 @@
 const axios = require('axios');
 const env = require('../config/env');
+const logger = require('../config/logger');
 
 function isTelephonyEnabled() {
   return Boolean(env.telephony?.enabled);
+}
+
+function resolveApiStyle() {
+  const raw = String(env.telephony?.apiStyle || 'auto').trim().toLowerCase();
+  const path = String(env.telephony?.endpointPath || '').toLowerCase();
+  if (raw === 'legacy' || raw === 'support') return raw;
+  if (path.includes('click_to_call_support')) return 'support';
+  return 'legacy';
+}
+
+let legacyModeWarned = false;
+
+function warnLegacyNoVoiceBot() {
+  if (legacyModeWarned) return;
+  legacyModeWarned = true;
+  logger.warn(
+    '[telephony] Tata legacy /v1/click_to_call only connects Smartflo’s configured leg; it does not stream SalesPal text. ' +
+      'For project-specific speech on the handset, use Smartflo “Click to Call Support API” with destination = Voice Bot ' +
+      '(see https://docs.smartflo.tatatelebusiness.com/docs/copy-of-standard-operating-procedure-sop-for-voice-streaming) ' +
+      'and set TATA_CALL_ENDPOINT_PATH=/v1/click_to_call_support plus TATA_CALL_API_STYLE=support (or path-based auto).'
+  );
 }
 
 function buildAuthHeader() {
@@ -34,6 +56,154 @@ function joinUrl(base, path) {
 }
 
 const OPENER_PAYLOAD_MAX_LEN = 950;
+const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
+
+function buildCustomIdentifierPayload({ conversationId, opener, projectName, projectId, leadName, locale }) {
+  const base = {
+    v: 1,
+    salespal_conversation_id: conversationId,
+    project_name: projectName ? String(projectName).trim().slice(0, 240) : '',
+    project_id: projectId ? String(projectId).trim().slice(0, 120) : '',
+    opener: String(opener || '').trim().slice(0, 720),
+    lead_name: leadName ? String(leadName).trim().slice(0, 120) : '',
+    locale: locale ? String(locale).trim().slice(0, 40) : '',
+  };
+  let s = JSON.stringify(base);
+  if (s.length <= CUSTOM_IDENTIFIER_MAX_LEN) return s;
+  base.opener = String(opener || '').trim().slice(0, 360);
+  s = JSON.stringify(base);
+  if (s.length <= CUSTOM_IDENTIFIER_MAX_LEN) return s;
+  base.opener = String(opener || '').trim().slice(0, 200);
+  return JSON.stringify(base).slice(0, CUSTOM_IDENTIFIER_MAX_LEN);
+}
+
+/**
+ * Legacy Smartflo click_to_call — dials agent + customer per account rules; extra JSON fields are usually ignored.
+ */
+async function postLegacyClickToCall(apiUrl, headers, payloadBase) {
+  const destinationNumber = payloadBase.destinationNumber;
+  const agentNumber = payloadBase.agentNumber;
+  const callerId = payloadBase.callerId;
+  const openerTrimmed = payloadBase.openerTrimmed;
+  const pn = payloadBase.pn;
+  const pid = payloadBase.pid;
+  const { conversationId, leadName } = payloadBase;
+
+  const salespal = {
+    conversation_id: conversationId,
+    opener: openerTrimmed,
+    ...(pn ? { project_name: pn } : {}),
+    ...(pid ? { project_id: pid } : {}),
+    ...(payloadBase.locale ? { locale: String(payloadBase.locale).slice(0, 40) } : {}),
+  };
+
+  const customIdentifier = buildCustomIdentifierPayload({
+    conversationId,
+    opener: openerTrimmed,
+    projectName: pn,
+    projectId: pid,
+    leadName,
+    locale: payloadBase.locale,
+  });
+
+  const payload = {
+    async: Number(env.telephony.asyncMode ?? 1),
+    agent_number: agentNumber || undefined,
+    destination_number: destinationNumber || undefined,
+    caller_id: callerId || undefined,
+    call_timeout: Number(env.telephony.ringTimeoutMs ?? 3500),
+    get_call_id: Number(env.telephony.getCallId ?? 1),
+    ...env.telephony.staticPayload,
+    leadName: leadName || undefined,
+    conversationId,
+    webhookUrl: env.telephony.statusWebhookUrl || undefined,
+    custom_identifier: customIdentifier,
+    opening_message: openerTrimmed,
+    opening_line: openerTrimmed,
+    ...(pn ? { project_name: pn, salespal_listing_name: pn } : {}),
+    ...(pid ? { salespal_project_id: pid } : {}),
+    salespal,
+    ai: {
+      opener: openerTrimmed,
+      opening_line: openerTrimmed,
+      ...(pn ? { project_listing_name: pn } : {}),
+    },
+  };
+
+  warnLegacyNoVoiceBot();
+
+  logger.info('[telephony] Tata legacy click_to_call request', {
+    destination_tail: destinationNumber.slice(-4),
+    opener_len: openerTrimmed.length,
+    has_project: Boolean(pn),
+  });
+
+  return axios.post(apiUrl, payload, {
+    headers,
+    timeout: env.telephony.timeoutMs,
+    validateStatus: () => true,
+  });
+}
+
+/**
+ * Smartflo Click to Call Support API — outbound calls that attach to a Voice Bot (WebSocket streaming).
+ * Docs: webhook returns custom_identifier; Voice Bot destination is bound to this API key in the portal.
+ */
+async function postSupportClickToCall(apiUrl, payloadBase) {
+  const destinationNumber = payloadBase.destinationNumber;
+  const callerId = payloadBase.callerId;
+  const openerTrimmed = payloadBase.openerTrimmed;
+  const pn = payloadBase.pn;
+  const pid = payloadBase.pid;
+  const supportKey =
+    String(env.telephony.supportApiKey || '').trim() || String(env.telephony.apiKey || '').trim();
+  if (!supportKey) {
+    const err = new Error('Tata Support API requires api_key in body (set TATA_CALL_API_KEY or TATA_CALL_SUPPORT_API_KEY).');
+    err.code = 'TATA_CONFIG_ERROR';
+    throw err;
+  }
+
+  const ringMs = Number(env.telephony.ringTimeoutMs ?? 30000);
+  const ringSec = Math.max(10, Math.min(30, Math.ceil(ringMs / 1000)));
+
+  const custom_identifier = buildCustomIdentifierPayload({
+    conversationId: payloadBase.conversationId,
+    opener: openerTrimmed,
+    projectName: pn,
+    projectId: pid,
+    leadName: payloadBase.leadName,
+    locale: payloadBase.locale,
+  });
+
+  const payload = {
+    ...env.telephony.staticPayload,
+    api_key: supportKey,
+    customer_number: destinationNumber,
+    async: Number(env.telephony.asyncMode ?? 1) || 1,
+    ...(callerId ? { caller_id: callerId } : {}),
+    customer_ring_timeout: ringSec,
+    custom_identifier,
+  };
+
+  logger.info('[telephony] Tata click_to_call_support request', {
+    destination_tail: destinationNumber.slice(-4),
+    opener_len: openerTrimmed.length,
+    has_project: Boolean(pn),
+    custom_identifier_len: custom_identifier.length,
+  });
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    ...env.telephony.extraHeaders,
+  };
+
+  return axios.post(apiUrl, payload, {
+    headers,
+    timeout: env.telephony.timeoutMs,
+    validateStatus: () => true,
+  });
+}
 
 async function placeOutboundCall({
   to,
@@ -59,14 +229,9 @@ async function placeOutboundCall({
     err.code = 'TATA_CONFIG_ERROR';
     throw err;
   }
-  const apiUrl = joinUrl(apiBase, env.telephony?.endpointPath || '/v1/click_to_call');
-
-  const authHeader = buildAuthHeader();
-  const headers = {
-    'Content-Type': 'application/json',
-    ...env.telephony.extraHeaders,
-  };
-  if (authHeader) headers.Authorization = authHeader;
+  const endpointPath = env.telephony?.endpointPath || '/v1/click_to_call';
+  const apiUrl = joinUrl(apiBase, endpointPath);
+  const apiStyle = resolveApiStyle();
 
   const destinationNumber = String(to || '').replace(/[^\d]/g, '');
   const agentNumber = String(env.telephony.fromNumber || '').replace(/[^\d]/g, '');
@@ -74,43 +239,33 @@ async function placeOutboundCall({
   const openerTrimmed = String(opener || '').trim().slice(0, OPENER_PAYLOAD_MAX_LEN);
   const pn = projectName ? String(projectName).trim().slice(0, 240) : '';
   const pid = projectId ? String(projectId).trim().slice(0, 120) : '';
-  /** Smartflo docs only list core click_to_call keys; partner voice stacks often read custom blobs — mirror opener under several aliases. */
-  const salespal = {
-    conversation_id: conversationId,
-    opener: openerTrimmed,
-    ...(pn ? { project_name: pn } : {}),
-    ...(pid ? { project_id: pid } : {}),
-    ...(locale ? { locale: String(locale).slice(0, 40) } : {}),
-  };
-  const payload = {
-    async: Number(env.telephony.asyncMode ?? 1),
-    agent_number: agentNumber || undefined,
-    destination_number: destinationNumber || undefined,
-    caller_id: callerId || undefined,
-    call_timeout: Number(env.telephony.ringTimeoutMs ?? 3500),
-    get_call_id: Number(env.telephony.getCallId ?? 1),
-    ...env.telephony.staticPayload,
-    leadName: leadName || undefined,
+
+  const payloadBase = {
+    destinationNumber,
+    agentNumber,
+    callerId,
+    openerTrimmed,
+    pn,
+    pid,
     conversationId,
-    webhookUrl: env.telephony.statusWebhookUrl || undefined,
-    opening_message: openerTrimmed,
-    opening_line: openerTrimmed,
-    ...(pn ? { project_name: pn, salespal_listing_name: pn } : {}),
-    ...(pid ? { salespal_project_id: pid } : {}),
-    salespal,
-    ai: {
-      opener: openerTrimmed,
-      opening_line: openerTrimmed,
-      ...(pn ? { project_listing_name: pn } : {}),
-    },
+    leadName,
+    locale,
   };
 
   try {
-    const response = await axios.post(apiUrl, payload, {
-      headers,
-      timeout: env.telephony.timeoutMs,
-      validateStatus: () => true,
-    });
+    let response;
+    if (apiStyle === 'support') {
+      response = await postSupportClickToCall(apiUrl, payloadBase);
+    } else {
+      const authHeader = buildAuthHeader();
+      const headers = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...env.telephony.extraHeaders,
+      };
+      if (authHeader) headers.Authorization = authHeader;
+      response = await postLegacyClickToCall(apiUrl, headers, payloadBase);
+    }
 
     if (response.status < 200 || response.status >= 300) {
       const err = new Error(
@@ -126,6 +281,7 @@ async function placeOutboundCall({
       enabled: true,
       provider: 'tata',
       accepted: true,
+      apiStyle,
       statusCode: response.status,
       providerCallId:
         data.callId ||
@@ -150,4 +306,5 @@ module.exports = {
   isTelephonyEnabled,
   placeOutboundCall,
   parseJsonObject,
+  resolveApiStyle,
 };

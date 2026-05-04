@@ -97,6 +97,14 @@ const envSchema = z.object({
   TATA_CALL_ENABLED: z.string().optional().default('false'),
   TATA_CALL_API_URL: z.string().optional(),
   TATA_CALL_ENDPOINT_PATH: z.string().optional().default('/v1/click_to_call'),
+  /**
+   * legacy = agent_number + destination (portal IVR; often ignores custom opener).
+   * support = Click to Call Support API (customer_number + api_key in JSON) — required for Smartflo Voice Bot streaming.
+   * auto = pick support when ENDPOINT_PATH contains `click_to_call_support`, else legacy.
+   */
+  TATA_CALL_API_STYLE: z.string().optional().default('auto'),
+  /** Optional separate key for Support API body `api_key`; defaults to TATA_CALL_API_KEY */
+  TATA_CALL_SUPPORT_API_KEY: z.string().optional().default(''),
   TATA_CALL_API_KEY: z.string().optional(),
   TATA_CALL_AUTH_SCHEME: z.string().optional().default('Bearer'),
   TATA_CALL_FROM_NUMBER: z.string().optional().default(''),
@@ -246,6 +254,8 @@ const env = {
     enabled: String(parsed.TATA_CALL_ENABLED || 'false').toLowerCase() === 'true',
     apiUrl: parsed.TATA_CALL_API_URL || '',
     endpointPath: parsed.TATA_CALL_ENDPOINT_PATH || '/v1/click_to_call',
+    apiStyle: String(parsed.TATA_CALL_API_STYLE || 'auto').trim().toLowerCase(),
+    supportApiKey: String(parsed.TATA_CALL_SUPPORT_API_KEY || '').trim(),
     apiKey: parsed.TATA_CALL_API_KEY || '',
     authScheme: parsed.TATA_CALL_AUTH_SCHEME || 'Bearer',
     fromNumber: parsed.TATA_CALL_FROM_NUMBER || '',

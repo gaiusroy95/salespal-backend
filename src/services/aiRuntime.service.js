@@ -418,6 +418,44 @@ function ensureOpenerNamesProjectListing(opener, projectName, locale) {
   return base ? `${glue} ${base}`.trim() : glue;
 }
 
+/**
+ * PSTN line sold to the lead: only the selected project (Smartflo portal bot often ignores extras;
+ * this text is also embedded in `custom_identifier` for Voice Bot streaming integrations).
+ */
+function buildStrictTelephonyProjectOpener({ locale, contactName, projectName, projectBrief, agentName }) {
+  const pn = String(projectName || '').trim();
+  const raw = String(contactName || '').trim();
+  const first = raw.split(/\s+/)[0] || 'there';
+  const ji = honorificNameJi(raw) || `${first} Ji`;
+  const agent = String(agentName || 'SalesPal AI').trim().slice(0, 40);
+  const loc = String(locale || 'hing').toLowerCase().replace(/_/g, '-');
+
+  let fact = '';
+  const pb = String(projectBrief || '').trim();
+  if (pb) {
+    const chunk = pb.split(/(?<=[.!?])\s+/)[0] || pb.split('\n')[0] || pb;
+    fact = String(chunk).trim().replace(/\s+/g, ' ').slice(0, 130);
+  }
+
+  if (!pn) {
+    if (loc.startsWith('hi') || loc.startsWith('hing') || /^hi-?in\b/.test(loc)) {
+      return `Namaskar ${ji}, main ${agent} bol raha hoon. Is call ka purpose real-estate listing discuss karna hai — kripya SalesPal me project select karke dubara call lagayein.`;
+    }
+    return `Hello ${ji}, this is ${agent}. This automated line is meant to discuss one specific project your team selects in SalesPal.`;
+  }
+
+  if (loc.startsWith('hi') || loc.startsWith('hing') || /^hi-?in\b/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Namaskar ${ji}, main ${agent} bol raha hoon. Ye call sirf ${pn} project ke liye hai — iske alawa koi aur topic nahi.${tail} Aapko location pasand hai ya pehle budget discuss karna hai?`;
+  }
+  if (/^(mr|ta|te|kn|ml|gu|bn|pa)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Hello ${ji}, ${agent} here. I'm calling only about the ${pn} listing — nothing else on this line.${tail} Should we start with location, pricing, or a site visit?`;
+  }
+  const tail = fact ? ` ${fact}` : '';
+  return `Hello ${ji}, this is ${agent}. This call is only about ${pn}.${tail} What would you like to know first — location, pricing, or timeline?`;
+}
+
 function normalizeAgentName(name) {
   const raw = String(name || '').trim();
   if (!raw) return 'SalesPal AI';
@@ -687,17 +725,50 @@ async function createVoiceSession({
     }
   }
 
-  let opener = await buildContextualVoiceOpener({
-    locale: locale || 'hing',
-    contactName,
-    openerContext: mergedOpenerContext,
-    projectBrief: voiceProjectBrief,
-    projectName: voiceProjectName,
-  });
+  const willDialPstn = Boolean(phone && tataVoiceService.isTelephonyEnabled());
 
-  /** PSTN (Tata) must hear the listing name even if Gemini paraphrases it away — keep SPA + telco opener aligned. */
-  if (voiceProjectName) {
-    opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+  let opener;
+  if (willDialPstn) {
+    if (voiceProjectName) {
+      opener = buildStrictTelephonyProjectOpener({
+        locale: locale || 'hing',
+        contactName,
+        projectName: voiceProjectName,
+        projectBrief: voiceProjectBrief,
+        agentName: safeAgentName,
+      });
+    } else if (projectId) {
+      console.warn('[aiRuntime] PSTN dial missing display project name — using fallback opener wording.');
+      opener = buildStrictTelephonyProjectOpener({
+        locale: locale || 'hing',
+        contactName,
+        projectName: 'your selected CRM project',
+        projectBrief: voiceProjectBrief,
+        agentName: safeAgentName,
+      });
+    } else {
+      opener = await buildContextualVoiceOpener({
+        locale: locale || 'hing',
+        contactName,
+        openerContext: mergedOpenerContext,
+        projectBrief: voiceProjectBrief,
+        projectName: voiceProjectName,
+      });
+      if (voiceProjectName) {
+        opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+      }
+    }
+  } else {
+    opener = await buildContextualVoiceOpener({
+      locale: locale || 'hing',
+      contactName,
+      openerContext: mergedOpenerContext,
+      projectBrief: voiceProjectBrief,
+      projectName: voiceProjectName,
+    });
+    if (voiceProjectName) {
+      opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+    }
   }
 
   await db.query(
@@ -742,6 +813,11 @@ async function createVoiceSession({
       projectId: projectId || null,
       locale: locale || 'hing',
     });
+    const style = typeof telephony.apiStyle === 'string' ? telephony.apiStyle : tataVoiceService.resolveApiStyle();
+    if (telephony.accepted && style === 'legacy') {
+      telephony.integration_notice =
+        'Handset playback is controlled by Smartflo’s legacy click-to-call leg; it does not read SalesPal’s opener. Migrate to Smartflo Voice Bot + /v1/click_to_call_support (backend .env.example) for listing-specific PSTN dialogue.';
+    }
   }
 
   return {

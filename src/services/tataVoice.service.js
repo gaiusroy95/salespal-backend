@@ -11,7 +11,16 @@ function resolveApiStyle() {
   const path = String(env.telephony?.endpointPath || '').toLowerCase();
   if (raw === 'legacy' || raw === 'support') return raw;
   if (path.includes('click_to_call_support')) return 'support';
+  if (String(env.telephony?.supportApiKey || '').trim()) return 'support';
   return 'legacy';
+}
+
+function resolveEndpointPathForStyle(style) {
+  const configured = String(env.telephony?.endpointPath || '/v1/click_to_call').trim();
+  if (style !== 'support') return configured || '/v1/click_to_call';
+  if (configured.toLowerCase().includes('click_to_call_support')) return configured;
+  /** Auto-heal common misconfig: Support API style with legacy endpoint path. */
+  return '/v1/click_to_call_support';
 }
 
 let legacyModeWarned = false;
@@ -229,7 +238,7 @@ async function placeOutboundCall({
     err.code = 'TATA_CONFIG_ERROR';
     throw err;
   }
-  const endpointPath = env.telephony?.endpointPath || '/v1/click_to_call';
+  const endpointPath = resolveEndpointPathForStyle(resolveApiStyle());
   const apiUrl = joinUrl(apiBase, endpointPath);
   const apiStyle = resolveApiStyle();
 
@@ -239,6 +248,21 @@ async function placeOutboundCall({
   const openerTrimmed = String(opener || '').trim().slice(0, OPENER_PAYLOAD_MAX_LEN);
   const pn = projectName ? String(projectName).trim().slice(0, 240) : '';
   const pid = projectId ? String(projectId).trim().slice(0, 120) : '';
+
+  if (apiStyle === 'legacy' && pn) {
+    const err = new Error(
+      'Project-specific PSTN dialogue requires Smartflo Click to Call Support API + Voice Bot destination. Legacy /v1/click_to_call cannot guarantee project speech.'
+    );
+    err.code = 'TATA_PROJECT_SPEECH_UNSUPPORTED_IN_LEGACY';
+    err.details = {
+      required_endpoint: '/v1/click_to_call_support',
+      required_style: 'support',
+      current_endpoint: String(env.telephony?.endpointPath || '/v1/click_to_call'),
+      current_style: String(env.telephony?.apiStyle || 'auto'),
+      project_name: pn,
+    };
+    throw err;
+  }
 
   const payloadBase = {
     destinationNumber,

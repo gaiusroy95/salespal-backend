@@ -476,19 +476,45 @@ async function uploadAndAnalyzeCustomers(req, res, next) {
     }
 
     // Standardize, Validate, and Clean
-    let processed = customers
-      .map(c => ({
+    const normalizedRows = customers.map(c => ({
         name: String(c.name || '').trim(),
         phone: normalizePhoneNumber(c.phone),
         email: (c.email || '').toLowerCase().trim() || null,
         totalAmount: parseAmount(c.totalAmount || c.totalDue || 0),
         paidAmount: parseAmount(c.paidAmount || c.amountPaid || 0),
         dueDate: c.dueDate || null,
-      }))
-      .filter(c => c.name && c.phone); // Rule: Must have name AND phone
+      }));
+
+    const invalidRows = normalizedRows.filter(c => !c.name || !c.phone);
+    let processed = normalizedRows.filter(c => c.name && c.phone); // Rule: Must have name AND phone
 
     // Deduplicate by phone
     processed = removeCustomerDuplicates(processed);
+
+    if (!processed.length) {
+      const sampleKeys = rawRecords?.[0] && typeof rawRecords[0] === 'object'
+        ? Object.keys(rawRecords[0]).slice(0, 12)
+        : [];
+      const missingName = invalidRows.length
+        ? invalidRows.filter((r) => !r.name).length
+        : 0;
+      const missingPhone = invalidRows.length
+        ? invalidRows.filter((r) => !r.phone).length
+        : 0;
+      return res.status(422).json({
+        error: {
+          code: 'NO_VALID_CUSTOMERS_EXTRACTED',
+          message:
+            'AI could not extract valid customer rows. Each row needs at least Name and Phone. Please check your PDF/table text and try again.',
+          details: {
+            rowsParsed: normalizedRows.length,
+            missingNameRows: missingName,
+            missingPhoneRows: missingPhone,
+            sampleInputKeys: sampleKeys,
+          },
+        },
+      });
+    }
 
     res.json({
       success: true,

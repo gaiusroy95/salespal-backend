@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const crypto = require('crypto');
+const env = require('../config/env');
 const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
@@ -394,6 +395,12 @@ function zonedDateToUtcIso(year, month, day, hh, mm, timeZone) {
 
 const CALL_WINDOW_START_HOUR = 9;
 const CALL_WINDOW_END_HOUR = 21; // exclusive
+const OUTBOUND_DND_START_HOUR = 21;
+const OUTBOUND_DND_END_HOUR = 9;
+const WHATSAPP_MAX_RETRY_ATTEMPTS = 4;
+const WHATSAPP_DAY1_RETRY_GAP_MS = 7 * 60 * 60 * 1000; // ~6-8 hours
+const WHATSAPP_LATER_RETRY_GAP_MS = 48 * 60 * 60 * 1000; // day3/day5 pattern
+const LOST_EVAL_DELAY_MS = 48 * 60 * 60 * 1000;
 
 function getZonedParts(dateInput, timeZone = 'Asia/Kolkata') {
   const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
@@ -429,6 +436,101 @@ function nextAvailableCallIso(scheduleAt, timeZone = 'Asia/Kolkata') {
     return zonedDateToUtcIso(y, m, d, CALL_WINDOW_START_HOUR, 0, timeZone);
   }
   return zonedDateToUtcIso(y, m, d + 1, CALL_WINDOW_START_HOUR, 0, timeZone);
+}
+
+function isWithinOutboundWindow(scheduleAt, timeZone = 'Asia/Kolkata') {
+  const z = getZonedParts(scheduleAt, timeZone);
+  const hh = Number(z.hour || 0);
+  return hh >= OUTBOUND_DND_END_HOUR && hh < OUTBOUND_DND_START_HOUR;
+}
+
+function nextAvailableOutboundIso(scheduleAt, timeZone = 'Asia/Kolkata') {
+  const z = getZonedParts(scheduleAt, timeZone);
+  const y = Number(z.year);
+  const m = Number(z.month);
+  const d = Number(z.day);
+  const hh = Number(z.hour || 0);
+  if (hh < OUTBOUND_DND_END_HOUR) {
+    return zonedDateToUtcIso(y, m, d, OUTBOUND_DND_END_HOUR, 0, timeZone);
+  }
+  return zonedDateToUtcIso(y, m, d + 1, OUTBOUND_DND_END_HOUR, 0, timeZone);
+}
+
+function containsStopIntent(text) {
+  const t = String(text || '').toLowerCase();
+  return /\b(stop|unsubscribe|opt[\s-]?out|do not message|don't message|block)\b/.test(t);
+}
+
+function containsHumanHelpIntent(text) {
+  const t = String(text || '').toLowerCase();
+  return /\b(human|agent|call me|representative|manager|owner|person)\b/.test(t);
+}
+
+function nextRetryAtIso(baseIso, attemptNumber, leadTimezone) {
+  const baseTs = new Date(baseIso).getTime();
+  if (!Number.isFinite(baseTs)) return new Date(Date.now() + WHATSAPP_DAY1_RETRY_GAP_MS).toISOString();
+  const attempt = Number(attemptNumber || 1);
+  const plusMs = attempt <= 2 ? WHATSAPP_DAY1_RETRY_GAP_MS : WHATSAPP_LATER_RETRY_GAP_MS;
+  const nextIso = new Date(baseTs + plusMs).toISOString();
+  if (isWithinOutboundWindow(nextIso, leadTimezone)) return nextIso;
+  return nextAvailableOutboundIso(nextIso, leadTimezone);
+}
+
+async function hasInboundReplySince({ leadId, sinceIso }) {
+  const { rows } = await db.query(
+    `SELECT 1
+     FROM lead_actions
+     WHERE lead_id = $1
+       AND type = 'whatsapp'
+       AND COALESCE(metadata->>'sender', '') = 'Lead'
+       AND created_at >= $2::timestamptz
+     LIMIT 1`,
+    [leadId, sinceIso]
+  );
+  return Boolean(rows[0]);
+}
+
+async function summarizeOutboundDeliverySince({ leadId, sinceIso }) {
+  const { rows } = await db.query(
+    `SELECT
+       COUNT(*)::int AS total,
+       SUM(CASE WHEN COALESCE(metadata->'delivery'->>'status','') IN ('single_tick','sent') THEN 1 ELSE 0 END)::int AS pending_delivery,
+       SUM(CASE WHEN COALESCE(metadata->'delivery'->>'status','') IN ('delivered','read') THEN 1 ELSE 0 END)::int AS delivered_or_read
+     FROM lead_actions
+     WHERE lead_id = $1
+       AND type = 'whatsapp'
+       AND COALESCE(metadata->>'sender', '') <> 'Lead'
+       AND created_at >= $2::timestamptz`,
+    [leadId, sinceIso]
+  );
+  return rows[0] || { total: 0, pending_delivery: 0, delivered_or_read: 0 };
+}
+
+async function appendLeadAction({ leadId, userId, type, content, outcome, metadata }) {
+  await db.query(
+    `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+    [leadId, userId, type, content, outcome, JSON.stringify(metadata || {})]
+  );
+}
+
+async function getOwnerReportSettings(userId) {
+  const { rows } = await db.query(
+    `SELECT metadata->'settings' AS settings
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const settings = rows[0]?.settings && typeof rows[0].settings === 'object' ? rows[0].settings : {};
+  const rpt = settings.ownerWhatsAppReports && typeof settings.ownerWhatsAppReports === 'object'
+    ? settings.ownerWhatsAppReports
+    : {};
+  return {
+    morningEnabled: rpt.morningEnabled !== false,
+    eveningEnabled: rpt.eveningEnabled !== false,
+    timezone: String(rpt.timezone || env.leadScheduleDefaultTz || 'Asia/Kolkata'),
+  };
 }
 
 function parseNaturalScheduleAt(text, timeZone = 'Asia/Kolkata') {
@@ -564,6 +666,27 @@ async function createLeadAction(req, res, next) {
     );
 
     let row = rows[0];
+    if (type === 'whatsapp') {
+      const sender = String(meta.sender || '').toLowerCase();
+      const isHumanOutbound = sender === 'salesrep' || sender === 'human' || sender === 'owner';
+      if (isHumanOutbound) {
+        const takeoverUntilIso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+        await db.query(
+          `UPDATE leads
+           SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [
+            leadId,
+            JSON.stringify({
+              whatsappHumanTakeoverUntil: takeoverUntilIso,
+              whatsappHumanTakeoverBy: req.user.id,
+              whatsappHumanTakeoverMode: 'human',
+            }),
+          ]
+        );
+      }
+    }
     if (type === 'whatsapp' && !meta.automationJobId && meta.sender !== 'Lead') {
       const text = String(content || '').trim();
       if (text && whatsappService.isWhatsAppEnabled()) {
@@ -837,9 +960,66 @@ async function dispatchDueAutomationJobs(req, res, next) {
     const dispatchedJobs = [];
     for (const job of jobs) {
       const leadName = `${job.contact_first_name || ''} ${job.contact_last_name || ''}`.trim() || 'Lead';
+      const leadMetadata = job.metadata && typeof job.metadata === 'object' ? job.metadata : {};
+      const leadTimezone = String(leadMetadata.timezone || leadMetadata.leadTimezone || 'Asia/Kolkata');
+      const payloadObj = job.payload && typeof job.payload === 'object' ? job.payload : {};
+
+      if (payloadObj.kind === 'lost_eval') {
+        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso: String(payloadObj.sinceAt || job.created_at) });
+        const delivery = await summarizeOutboundDeliverySince({
+          leadId: job.lead_id,
+          sinceIso: String(payloadObj.sinceAt || job.created_at),
+        });
+        const pendingDeliveryOnly =
+          Number(delivery.total || 0) > 0 &&
+          Number(delivery.pending_delivery || 0) > 0 &&
+          Number(delivery.delivered_or_read || 0) === 0;
+        if (!hasReply && pendingDeliveryOnly) {
+          const { rows: latestLead } = await db.query(
+            `SELECT stage, metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`,
+            [job.lead_id, orgId]
+          );
+          if (latestLead[0]) {
+            const md = latestLead[0].metadata && typeof latestLead[0].metadata === 'object' ? latestLead[0].metadata : {};
+            await db.query(
+              `UPDATE leads
+               SET stage = 'closed_lost',
+                   metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+                   updated_at = NOW()
+               WHERE id = $1`,
+              [
+                job.lead_id,
+                JSON.stringify({
+                  ...md,
+                  aiScoreLabel: 'Lost',
+                  lostReason: 'whatsapp_no_response_after_retries_48h',
+                  lastActivityAt: new Date().toISOString(),
+                }),
+              ]
+            );
+            await appendLeadAction({
+              leadId: job.lead_id,
+              userId: req.user.id,
+              type: 'ai_action',
+              content: 'Lead auto-marked as Lost after WhatsApp retry sequence and 48h wait.',
+              outcome: 'lead_lost_retry_timeout',
+              metadata: { title: 'Lead marked Lost (automation)', automationJobId: job.id },
+            });
+          }
+        }
+        const { rows: updatedEvalJob } = await db.query(
+          `UPDATE sales_automation_jobs
+           SET status = 'completed', dispatched_at = NOW(), updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [job.id]
+        );
+        if (updatedEvalJob[0]) dispatchedJobs.push(updatedEvalJob[0]);
+        continue;
+      }
+
       if (job.target_channel === 'call') {
         try {
-          const leadMetadata = job.metadata && typeof job.metadata === 'object' ? job.metadata : {};
           const locale = leadMetadata.preferredLocale || 'hing';
           const projectId = leadMetadata.projectId || null;
           const agentName = leadMetadata.agentName || 'SalesPal AI';
@@ -916,12 +1096,49 @@ async function dispatchDueAutomationJobs(req, res, next) {
       }
 
       if (job.target_channel === 'whatsapp') {
+        if (!isWithinOutboundWindow(job.schedule_at, leadTimezone)) {
+          const shiftedIso = nextAvailableOutboundIso(job.schedule_at, leadTimezone);
+          await db.query(
+            `UPDATE sales_automation_jobs
+             SET schedule_at = $2::timestamptz, updated_at = NOW()
+             WHERE id = $1`,
+            [job.id, shiftedIso]
+          );
+          continue;
+        }
+        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso: String(job.created_at) });
+        if (hasReply) {
+          await db.query(
+            `UPDATE sales_automation_jobs
+             SET status = 'cancelled', updated_at = NOW()
+             WHERE id = $1`,
+            [job.id]
+          );
+          await appendLeadAction({
+            leadId: job.lead_id,
+            userId: req.user.id,
+            type: 'ai_action',
+            content: 'Stopped pending WhatsApp retries because lead replied.',
+            outcome: 'automation_retry_stopped_on_reply',
+            metadata: { title: 'Retries stopped', automationJobId: job.id },
+          });
+          continue;
+        }
+        if (Boolean(leadMetadata.whatsappOptOut)) {
+          await db.query(
+            `UPDATE sales_automation_jobs
+             SET status = 'cancelled', updated_at = NOW()
+             WHERE id = $1`,
+            [job.id]
+          );
+          continue;
+        }
         const requestedTemplate =
-          (job.payload && typeof job.payload === 'object' && String(job.payload.messageTemplate || '').trim()) || '';
+          String(payloadObj.messageTemplate || '').trim();
         let outboundText = requestedTemplate;
         if (!outboundText) {
           try {
-            const leadLocale = (job.metadata && typeof job.metadata === 'object' && job.metadata.preferredLocale) || 'hing';
+            const leadLocale = leadMetadata.preferredLocale || 'hing';
             outboundText = await aiService.callAIWithMessages(
               [
                 {
@@ -976,6 +1193,62 @@ async function dispatchDueAutomationJobs(req, res, next) {
               [job.id]
             );
             dispatchedJobs.push(updatedWaJob[0]);
+            const retryAttempt = Number(payloadObj.retryAttempt || 0);
+            const isFinalAttempt = retryAttempt >= WHATSAPP_MAX_RETRY_ATTEMPTS;
+            if (!isFinalAttempt) {
+              const nextAttempt = retryAttempt + 1;
+              const nextScheduleAt = nextRetryAtIso(job.schedule_at, nextAttempt, leadTimezone);
+              const retryFingerprint = buildAutomationFingerprint({
+                sourceChannel: 'whatsapp',
+                targetChannel: 'whatsapp',
+                scheduleAt: nextScheduleAt,
+                text: `${job.lead_id}:retry:${nextAttempt}`,
+              });
+              await db.query(
+                `INSERT INTO sales_automation_jobs (org_id, user_id, lead_id, source_channel, target_channel, schedule_at, payload, fingerprint)
+                 VALUES ($1,$2,$3,'whatsapp','whatsapp',$4,$5::jsonb,$6)
+                 ON CONFLICT ON CONSTRAINT ux_sales_automation_jobs_pending_fingerprint DO NOTHING`,
+                [
+                  orgId,
+                  req.user.id,
+                  job.lead_id,
+                  nextScheduleAt,
+                  JSON.stringify({
+                    ...payloadObj,
+                    retryAttempt: nextAttempt,
+                    retryParentJobId: job.id,
+                    messageTemplate: '',
+                  }),
+                  retryFingerprint,
+                ]
+              );
+            } else {
+              const evalAt = new Date(Date.now() + LOST_EVAL_DELAY_MS).toISOString();
+              const evalFingerprint = buildAutomationFingerprint({
+                sourceChannel: 'whatsapp',
+                targetChannel: 'whatsapp',
+                scheduleAt: evalAt,
+                text: `${job.lead_id}:lost_eval`,
+              });
+              await db.query(
+                `INSERT INTO sales_automation_jobs (org_id, user_id, lead_id, source_channel, target_channel, schedule_at, payload, fingerprint)
+                 VALUES ($1,$2,$3,'whatsapp','whatsapp',$4,$5::jsonb,$6)
+                 ON CONFLICT ON CONSTRAINT ux_sales_automation_jobs_pending_fingerprint DO NOTHING`,
+                [
+                  orgId,
+                  req.user.id,
+                  job.lead_id,
+                  evalAt,
+                  JSON.stringify({
+                    kind: 'lost_eval',
+                    sinceAt: job.created_at,
+                    reason: 'retry_sequence_completed',
+                    finalAttemptJobId: job.id,
+                  }),
+                  evalFingerprint,
+                ]
+              );
+            }
             continue;
           } catch (waErr) {
             await db.query(
@@ -1056,6 +1329,168 @@ async function dispatchDueAutomationJobs(req, res, next) {
       dispatchedJobs.push(updated[0]);
     }
     res.json({ dispatched: dispatchedJobs.length, jobs: dispatchedJobs });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function dispatchOwnerDailyReports(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    if (!whatsappService.isWhatsAppEnabled()) {
+      return res.status(503).json({ error: { code: 'WHATSAPP_NOT_CONFIGURED', message: 'WhatsApp not configured' } });
+    }
+    const ownerPhone = String(env.ownerWhatsappMsisdn || '').trim();
+    if (!ownerPhone) {
+      return res.status(400).json({ error: { code: 'OWNER_WHATSAPP_NOT_CONFIGURED', message: 'OWNER_WHATSAPP_MSISDN missing' } });
+    }
+    const mode = String(req.body?.mode || 'evening').toLowerCase() === 'morning' ? 'morning' : 'evening';
+    const pref = await getOwnerReportSettings(req.user.id);
+    const enabled = mode === 'morning' ? pref.morningEnabled : pref.eveningEnabled;
+    if (!enabled) return res.json({ ok: true, skipped: true, reason: `${mode}_disabled` });
+    const tz = String(req.body?.timezone || pref.timezone || env.leadScheduleDefaultTz || 'Asia/Kolkata');
+
+    const [{ rows: leadStats }, { rows: activityStats }, { rows: hotRows }] = await Promise.all([
+      db.query(
+        `SELECT
+           COUNT(*)::int AS total,
+           SUM(CASE WHEN COALESCE(metadata->>'aiScoreLabel','') = 'Hot' THEN 1 ELSE 0 END)::int AS hot,
+           SUM(CASE WHEN COALESCE(metadata->>'aiScoreLabel','') = 'Warm' THEN 1 ELSE 0 END)::int AS warm,
+           SUM(CASE WHEN COALESCE(metadata->>'aiScoreLabel','') = 'Cold' THEN 1 ELSE 0 END)::int AS cold,
+           SUM(CASE WHEN stage = 'closed_lost' THEN 1 ELSE 0 END)::int AS lost
+         FROM leads
+         WHERE org_id = $1`,
+        [orgId]
+      ),
+      db.query(
+        `SELECT
+           SUM(CASE WHEN type = 'call' THEN 1 ELSE 0 END)::int AS calls,
+           SUM(CASE WHEN type = 'whatsapp' THEN 1 ELSE 0 END)::int AS whatsapp,
+           SUM(CASE WHEN type = 'whatsapp' AND COALESCE(metadata->>'sender','') = 'Lead' THEN 1 ELSE 0 END)::int AS replies
+         FROM lead_actions
+         WHERE created_at >= date_trunc('day', NOW() AT TIME ZONE $2) AT TIME ZONE $2
+           AND lead_id IN (SELECT id FROM leads WHERE org_id = $1)`,
+        [orgId, tz]
+      ),
+      db.query(
+        `SELECT contact_first_name, contact_last_name
+         FROM leads
+         WHERE org_id = $1
+           AND COALESCE(metadata->>'aiScoreLabel','') = 'Hot'
+         ORDER BY updated_at DESC
+         LIMIT 3`,
+        [orgId]
+      ),
+    ]);
+
+    const ls = leadStats[0] || {};
+    const as = activityStats[0] || {};
+    const hotList = hotRows
+      .map((r) => `${String(r.contact_first_name || '').trim()} ${String(r.contact_last_name || '').trim()}`.trim())
+      .filter(Boolean);
+
+    const header = mode === 'morning' ? 'Today Plan' : 'Today Summary';
+    const msg = [
+      `${header}:`,
+      ``,
+      `Leads: ${ls.total || 0} (Hot ${ls.hot || 0}, Warm ${ls.warm || 0}, Cold ${ls.cold || 0}, Lost ${ls.lost || 0})`,
+      ``,
+      `Activity:`,
+      `Calls: ${as.calls || 0}`,
+      `WhatsApp: ${as.whatsapp || 0} chats`,
+      `Replies: ${as.replies || 0}`,
+      ``,
+      hotList.length ? `Hot Leads: ${hotList.map((x) => `- ${x}`).join('\n')}` : 'Hot Leads: none',
+      ``,
+      mode === 'morning'
+        ? 'Focus: Follow hot leads first.'
+        : 'Summary: Keep momentum on hot/warm follow-ups.',
+    ].join('\n');
+
+    const sent = await whatsappService.sendWhatsAppText({ to: ownerPhone, text: msg.slice(0, 3800) });
+    return res.json({ ok: true, mode, timezone: tz, messageId: sent.messageId || null });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getOwnerReportSettingsHandler(req, res, next) {
+  try {
+    const settings = await getOwnerReportSettings(req.user.id);
+    return res.json(settings);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateOwnerReportSettingsHandler(req, res, next) {
+  try {
+    const morningEnabled = req.body?.morningEnabled;
+    const eveningEnabled = req.body?.eveningEnabled;
+    const timezone = req.body?.timezone;
+    const nextPatch = {};
+    if (morningEnabled !== undefined) nextPatch.morningEnabled = Boolean(morningEnabled);
+    if (eveningEnabled !== undefined) nextPatch.eveningEnabled = Boolean(eveningEnabled);
+    if (timezone !== undefined) nextPatch.timezone = String(timezone || '').trim() || 'Asia/Kolkata';
+
+    const { rows } = await db.query(
+      `UPDATE users
+       SET metadata = COALESCE(metadata, '{}'::jsonb)
+         || jsonb_build_object(
+            'settings',
+            COALESCE(metadata->'settings', '{}'::jsonb)
+            || jsonb_build_object(
+                'ownerWhatsAppReports',
+                COALESCE(metadata->'settings'->'ownerWhatsAppReports', '{}'::jsonb) || $1::jsonb
+              )
+          ),
+          updated_at = NOW()
+       WHERE id = $2
+       RETURNING id`,
+      [JSON.stringify(nextPatch), req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    const settings = await getOwnerReportSettings(req.user.id);
+    return res.json(settings);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function setWhatsAppTakeover(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    const leadId = req.params.id;
+    const mode = String(req.body?.mode || 'human').toLowerCase() === 'ai' ? 'ai' : 'human';
+    const expiresInMins = Math.max(1, Math.min(120, Number(req.body?.expiresInMins || 30)));
+    const patch =
+      mode === 'human'
+        ? {
+            whatsappHumanTakeoverMode: 'human',
+            whatsappHumanTakeoverBy: req.user.id,
+            whatsappHumanTakeoverUntil: new Date(Date.now() + expiresInMins * 60 * 1000).toISOString(),
+          }
+        : {
+            whatsappHumanTakeoverMode: 'ai',
+            whatsappHumanTakeoverBy: null,
+            whatsappHumanTakeoverUntil: null,
+          };
+    const { rows } = await db.query(
+      `UPDATE leads
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb,
+           updated_at = NOW()
+       WHERE id = $1 AND org_id = $2
+       RETURNING id, metadata`,
+      [leadId, orgId, JSON.stringify(patch)]
+    );
+    if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+    return res.json({
+      leadId,
+      mode,
+      takeoverUntil: rows[0].metadata?.whatsappHumanTakeoverUntil || null,
+    });
   } catch (err) {
     next(err);
   }
@@ -1299,7 +1734,11 @@ module.exports = {
   addCampaignLead,
   createAutomationJob,
   dispatchDueAutomationJobs,
+  dispatchOwnerDailyReports,
+  getOwnerReportSettingsHandler,
+  updateOwnerReportSettingsHandler,
   listLeadAutomationJobs,
   updateAutomationJobStatus,
   cleanupLeadAutomationJobs,
+  setWhatsAppTakeover,
 };

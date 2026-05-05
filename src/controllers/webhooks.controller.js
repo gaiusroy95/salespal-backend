@@ -2,6 +2,7 @@ const db = require('../config/db');
 const env = require('../config/env');
 const logger = require('../config/logger');
 const whatsappService = require('../services/whatsapp.service');
+const aiService = require('../services/ai.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 
 function headerValue(req, name) {
@@ -34,6 +35,68 @@ function getCallStatus(payload) {
     .trim()
     .toLowerCase();
   return status || 'unknown';
+}
+
+function normalizeDigits(v) {
+  return String(v || '').replace(/[^\d]/g, '');
+}
+
+function isStopIntent(text) {
+  const t = String(text || '').toLowerCase();
+  return /\b(stop|unsubscribe|opt[\s-]?out|do not message|don't message|block)\b/.test(t);
+}
+
+function asksForHuman(text) {
+  const t = String(text || '').toLowerCase();
+  return /\b(human|agent|representative|manager|owner|person)\b/.test(t);
+}
+
+async function findLeadByPhone(phoneDigits) {
+  if (!phoneDigits) return null;
+  const { rows } = await db.query(
+    `SELECT id, org_id, user_id, assigned_to, contact_first_name, contact_last_name, contact_phone, metadata
+     FROM leads
+     WHERE regexp_replace(COALESCE(contact_phone, ''), '\D', '', 'g') = $1
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+    [phoneDigits]
+  );
+  return rows[0] || null;
+}
+
+async function buildWhatsAppHistory(leadId) {
+  const { rows } = await db.query(
+    `SELECT content, metadata
+     FROM lead_actions
+     WHERE lead_id = $1
+       AND type = 'whatsapp'
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [leadId]
+  );
+  return rows
+    .reverse()
+    .map((r) => {
+      const md = r.metadata && typeof r.metadata === 'object' ? r.metadata : {};
+      const sender = String(md.sender || '').toLowerCase() === 'lead' ? 'user' : 'assistant';
+      return { role: sender, content: String(r.content || '').trim() };
+    })
+    .filter((x) => x.content);
+}
+
+function shouldStayIn24hWindow(text) {
+  const t = String(text || '').toLowerCase();
+  return /(kal|tomorrow).*(baat|talk|follow|ping|message)/i.test(t);
+}
+
+async function upsertLeadMetadata(leadId, patch) {
+  await db.query(
+    `UPDATE leads
+     SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [leadId, JSON.stringify(patch || {})]
+  );
 }
 
 async function tataCallStatus(req, res) {
@@ -168,6 +231,163 @@ async function tataCallStatus(req, res) {
   }
 }
 
+function whatsappVerifyWebhook(req, res) {
+  const mode = String(req.query['hub.mode'] || '');
+  const token = String(req.query['hub.verify_token'] || '');
+  const challenge = String(req.query['hub.challenge'] || '');
+  const expected = String(env.whatsapp?.webhookVerifyToken || '').trim();
+  if (mode === 'subscribe' && expected && token === expected) {
+    return res.status(200).send(challenge || 'ok');
+  }
+  return res.status(403).json({ ok: false, message: 'Webhook verification failed' });
+}
+
+async function whatsappInbound(req, res) {
+  try {
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    const entries = Array.isArray(payload.entry) ? payload.entry : [];
+    for (const entry of entries) {
+      const changes = Array.isArray(entry.changes) ? entry.changes : [];
+      for (const ch of changes) {
+        const value = ch && ch.value && typeof ch.value === 'object' ? ch.value : {};
+        const messages = Array.isArray(value.messages) ? value.messages : [];
+        for (const msg of messages) {
+          const from = normalizeDigits(msg.from || '');
+          const text =
+            String(msg?.text?.body || msg?.button?.text || msg?.interactive?.button_reply?.title || '').trim();
+          if (!from || !text) continue;
+
+          const lead = await findLeadByPhone(from);
+          if (!lead) continue;
+          const leadName = `${lead.contact_first_name || ''} ${lead.contact_last_name || ''}`.trim() || 'Lead';
+          const actorUserId = lead.assigned_to || lead.user_id;
+          const leadMd = lead.metadata && typeof lead.metadata === 'object' ? lead.metadata : {};
+
+          await db.query(
+            `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
+             VALUES ($1,$2,'whatsapp',$3,'whatsapp_inbound_lead',$4::jsonb)`,
+            [
+              lead.id,
+              actorUserId,
+              text,
+              JSON.stringify({
+                title: 'Inbound WhatsApp',
+                sender: 'Lead',
+                delivery: {
+                  channel: 'whatsapp',
+                  status: 'received',
+                  provider: 'meta_whatsapp_cloud',
+                  messageId: msg.id || null,
+                },
+              }),
+            ]
+          );
+
+          if (isStopIntent(text)) {
+            await upsertLeadMetadata(lead.id, {
+              whatsappOptOut: true,
+              whatsappOptOutAt: new Date().toISOString(),
+              aiScoreLabel: 'Lost',
+              lastInteraction: 'Lead opted out on WhatsApp',
+            });
+            if (whatsappService.isWhatsAppEnabled()) {
+              await whatsappService.sendWhatsAppText({
+                to: lead.contact_phone || from,
+                text: `Noted ${honorificNameJi(leadName) || 'there'} — we will stop WhatsApp outreach.`,
+              });
+            }
+            continue;
+          }
+
+          if (asksForHuman(text)) {
+            await db.query(
+              `INSERT INTO notifications (user_id, org_id, type, title, message, body, read, metadata, created_at)
+               VALUES ($1,$2,'sales_automation',$3,$4,$4,false,$5::jsonb,NOW())`,
+              [
+                actorUserId,
+                lead.org_id,
+                'Lead requested human support',
+                `${leadName} asked for human help on WhatsApp.`,
+                JSON.stringify({ leadId: lead.id, channel: 'whatsapp', priority: 'critical' }),
+              ]
+            );
+          }
+
+          const takeoverUntil = new Date(String(leadMd.whatsappHumanTakeoverUntil || 0)).getTime();
+          if (Number.isFinite(takeoverUntil) && takeoverUntil > Date.now()) {
+            continue;
+          }
+
+          if (!whatsappService.isWhatsAppEnabled()) continue;
+          const history = await buildWhatsAppHistory(lead.id);
+          const systemPrompt = `${aiService.systemPromptForChat('whatsapp', {
+            leadPreferredLocale: String(leadMd.preferredLocale || 'hing'),
+            leadTimezone: String(leadMd.timezone || env.leadScheduleDefaultTz || 'Asia/Kolkata'),
+          })}\n\nPolicy: AI-first support. Try to resolve unless critical risk or explicit human escalation is necessary.`;
+          let aiReply = '';
+          try {
+            aiReply = await aiService.callAIWithMessages(history, systemPrompt, { temperature: 0.6 });
+          } catch (e) {
+            logger.warn(`WhatsApp AI reply fallback used: ${e?.message || e}`);
+            aiReply = `Namaste ${honorificNameJi(leadName) || ''}, thanks for your message. I can help with project details, pricing, and next steps here.`;
+          }
+          aiReply = String(aiReply || '').trim().slice(0, 1800);
+          if (!aiReply) continue;
+
+          const sent = await whatsappService.sendWhatsAppText({
+            to: lead.contact_phone || from,
+            text: aiReply,
+          });
+          await db.query(
+            `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
+             VALUES ($1,$2,'whatsapp',$3,'whatsapp_ai_auto_reply',$4::jsonb)`,
+            [
+              lead.id,
+              actorUserId,
+              aiReply,
+              JSON.stringify({
+                title: 'AI WhatsApp auto-reply',
+                sender: 'AI',
+                delivery: {
+                  channel: 'whatsapp',
+                  status: 'sent',
+                  provider: sent.provider,
+                  messageId: sent.messageId || null,
+                },
+              }),
+            ]
+          );
+
+          if (shouldStayIn24hWindow(text)) {
+            await db.query(
+              `INSERT INTO sales_automation_jobs (org_id, user_id, lead_id, source_channel, target_channel, schedule_at, payload, fingerprint)
+               VALUES ($1,$2,$3,'whatsapp','whatsapp', NOW() + interval '23 hour 30 minute', $4::jsonb, $5)
+               ON CONFLICT ON CONSTRAINT ux_sales_automation_jobs_pending_fingerprint DO NOTHING`,
+              [
+                lead.org_id,
+                actorUserId,
+                lead.id,
+                JSON.stringify({
+                  messageTemplate: '',
+                  contextHint: '24h conversation window follow-up',
+                  retryAttempt: 0,
+                }),
+                `wa-24h-window:${lead.id}:${new Date().toISOString().slice(0, 13)}`,
+              ]
+            );
+          }
+        }
+      }
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    logger.error(`WhatsApp webhook failed: ${err.message}`);
+    return res.status(500).json({ ok: false });
+  }
+}
+
 module.exports = {
   tataCallStatus,
+  whatsappVerifyWebhook,
+  whatsappInbound,
 };

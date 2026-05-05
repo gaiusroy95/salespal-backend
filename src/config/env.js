@@ -121,6 +121,7 @@ const envSchema = z.object({
   WHATSAPP_API_URL: z.string().optional().default(''),
   WHATSAPP_ACCESS_TOKEN: z.string().optional().default(''),
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional().default(''),
+  WHATSAPP_WEBHOOK_VERIFY_TOKEN: z.string().optional().default(''),
   WHATSAPP_TIMEOUT_MS: z.coerce.number().default(10000),
   /** Approved Meta template name for project catalogue dispatch (workflow A). */
   WHATSAPP_TEMPLATE_PROJECT_CATALOG: z.string().optional().default(''),
@@ -278,6 +279,7 @@ const env = {
         : ''),
     accessToken: parsed.WHATSAPP_ACCESS_TOKEN || '',
     phoneNumberId: parsed.WHATSAPP_PHONE_NUMBER_ID || '',
+    webhookVerifyToken: String(parsed.WHATSAPP_WEBHOOK_VERIFY_TOKEN || '').trim(),
     timeoutMs: parsed.WHATSAPP_TIMEOUT_MS,
     catalogueTemplateName: String(parsed.WHATSAPP_TEMPLATE_PROJECT_CATALOG || '').trim(),
     catalogueTemplateLang: String(parsed.WHATSAPP_TEMPLATE_LANGUAGE_CODE || 'en').trim() || 'en',

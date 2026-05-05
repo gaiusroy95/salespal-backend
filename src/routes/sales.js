@@ -62,6 +62,26 @@ router.post(
   validate,
   ctrl.dispatchDueAutomationJobs
 );
+router.post(
+  '/automation-jobs/owner-reports/dispatch',
+  [
+    body('mode').optional().isIn(['morning', 'evening']),
+    body('timezone').optional().isString().isLength({ max: 64 }),
+  ],
+  validate,
+  ctrl.dispatchOwnerDailyReports
+);
+router.get('/automation-jobs/owner-reports/settings', ctrl.getOwnerReportSettingsHandler);
+router.put(
+  '/automation-jobs/owner-reports/settings',
+  [
+    body('morningEnabled').optional().isBoolean(),
+    body('eveningEnabled').optional().isBoolean(),
+    body('timezone').optional().isString().isLength({ max: 64 }),
+  ],
+  validate,
+  ctrl.updateOwnerReportSettingsHandler
+);
 router.get(
   '/:id/automation-jobs',
   [param('id').isUUID(), query('status').optional().isIn(['pending', 'dispatched', 'cancelled', 'completed'])],
@@ -85,6 +105,16 @@ router.post(
   ],
   validate,
   ctrl.cleanupLeadAutomationJobs
+);
+router.post(
+  '/:id/whatsapp/takeover',
+  [
+    param('id').isUUID(),
+    body('mode').optional().isIn(['ai', 'human']),
+    body('expiresInMins').optional().isInt({ min: 1, max: 120 }),
+  ],
+  validate,
+  ctrl.setWhatsAppTakeover
 );
 
 router.get('/:id', [param('id').isUUID()], validate, ctrl.getDeal);

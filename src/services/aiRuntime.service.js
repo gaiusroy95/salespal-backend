@@ -352,11 +352,13 @@ async function loadVoiceTurns(conversationId) {
 }
 
 /** First spoken line when the call connects — matches lead default locale when possible. */
-function voiceOpenerForLocale(locale, contactName) {
+function voiceOpenerForLocale(locale, contactName, voiceGender = 'unknown') {
   const raw = String(contactName || '').trim();
   const first = raw.split(/\s+/)[0] || 'there';
   const ji = honorificNameJi(raw) || `${first} Ji`;
   const l = String(locale || 'hing').toLowerCase();
+  const g = String(voiceGender || 'unknown').toLowerCase();
+  const englishSalute = g === 'female' ? 'Hello Ms.' : g === 'male' ? 'Hello Mr.' : 'Hello';
   if (l === 'hi' || l === 'hin') {
     return `Namaste ${ji}, main SalesPal AI se baat kar raha hoon. Bataiye, aaj main aapki kaise madad kar sakta hoon?`;
   }
@@ -364,13 +366,13 @@ function voiceOpenerForLocale(locale, contactName) {
     return `Namaskar ${ji}! SalesPal AI bol raha hoon — naturally, clearly. Aaj main aapki kaise help kar sakta hoon?`;
   }
   if (l === 'en' || l.startsWith('en-')) {
-    return `Hello ${ji}, this is SalesPal AI — how can I help you today?`;
+    return `${englishSalute} ${ji}, this is SalesPal AI — how can I help you today?`;
   }
   return `Hello ${ji}, this is SalesPal AI. How can I help you today?`;
 }
 
-async function buildContextualVoiceOpener({ locale, contactName, openerContext, projectBrief, projectName }) {
-  const fallback = voiceOpenerForLocale(locale, contactName);
+async function buildContextualVoiceOpener({ locale, contactName, openerContext, projectBrief, projectName, voiceGender }) {
+  const fallback = voiceOpenerForLocale(locale, contactName, voiceGender);
   const context = String(openerContext || '').trim();
   const pb = String(projectBrief || '').trim();
   const pn = String(projectName || '').trim();
@@ -682,6 +684,7 @@ async function createVoiceSession({
   openerContext,
   projectId,
   agentName,
+  voiceGender,
   orgId,
   userId,
 }) {
@@ -712,6 +715,8 @@ async function createVoiceSession({
     voiceProjectBrief,
     voiceProjectName,
     voiceProjectHasKnowledge,
+    humanTakeoverActive: false,
+    voiceGender: String(voiceGender || 'unknown').toLowerCase(),
   };
   let mergedOpenerContext = String(openerContext || '').trim();
   if (leadId) {
@@ -753,6 +758,7 @@ async function createVoiceSession({
         openerContext: mergedOpenerContext,
         projectBrief: voiceProjectBrief,
         projectName: voiceProjectName,
+        voiceGender: metadata.voiceGender,
       });
       if (voiceProjectName) {
         opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
@@ -765,6 +771,7 @@ async function createVoiceSession({
       openerContext: mergedOpenerContext,
       projectBrief: voiceProjectBrief,
       projectName: voiceProjectName,
+      voiceGender: metadata.voiceGender,
     });
     if (voiceProjectName) {
       opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
@@ -832,6 +839,22 @@ async function createVoiceSession({
 async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   const row = await loadVoiceSession(conversationId);
   assertVoiceSessionAccess(row, { orgId, userId });
+  const mdEarly = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
+  if (Boolean(mdEarly.humanTakeoverActive)) {
+    const sessionRow = await loadVoiceSession(conversationId);
+    const turns = await loadVoiceTurns(conversationId);
+    return {
+      session: mapSessionRow(sessionRow, turns),
+      reply: 'Human agent mode is active for this conversation, so AI responses are paused.',
+      factSource: {
+        type: 'human_takeover',
+        label: 'Human takeover active',
+        projectId: mdEarly.projectId || null,
+        evidenceCount: 0,
+      },
+      aiSuppressed: true,
+    };
+  }
 
   await db.query(`INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'user', $2)`, [
     conversationId,
@@ -853,6 +876,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   const md = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
   const projectId = md.projectId || null;
   const voicePersona = String(md.voicePersona || '').trim().toLowerCase();
+  const voiceGender = String(md.voiceGender || 'unknown').trim().toLowerCase();
   let voiceProjectBrief = String(md.voiceProjectBrief || '').trim();
   let voiceProjectName = String(md.voiceProjectName || '').trim();
   const agentName = normalizeAgentName(md.agentName || 'SalesPal AI');
@@ -967,6 +991,7 @@ INTENT & CLASSIFICATION:
 IDENTITY:
 - Your name is "${agentName}" for this call.
 - Never claim another bot/persona name.
+- Preferred greeting personalization hint: lead voice profile is "${voiceGender}". Use only if it improves politeness naturally.
 
 LANGUAGE — HIGHEST PRIORITY (Regional fluency + global):
 - Respond in exactly the languages / dialects / scripts of the **last user utterance** — including simultaneous code-switch (e.g. Hinglish: English nouns + Hindi grammar). Mirror blend, slang, fillers, rhythm.

@@ -10,6 +10,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { scrapeWebsite } = require('../utils/scraper');
 const creditService = require('../services/credit.service');
+const aiRuntime = require('../services/aiRuntime.service');
 
 async function getOrgId(userId) {
   const { rows } = await db.query(`SELECT org_id FROM org_members WHERE user_id = $1 LIMIT 1`, [userId]);
@@ -1277,6 +1278,117 @@ async function generateAdImageHandler(req, res) {
   }
 }
 
+async function generateCustomCreative(req, res) {
+  try {
+    const {
+      type,
+      prompt,
+      style,
+      mediaSize,
+      durationSec,
+      brandName,
+      objective,
+      locale,
+      websiteUrl,
+      referenceImageUrl,
+    } = req.body || {};
+
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'ORG_REQUIRED', message: 'User must belong to an organization' },
+      });
+    }
+
+    const creativeType = String(type || 'image').toLowerCase() === 'video' ? 'video' : 'image';
+    const customPrompt = String(prompt || '').trim();
+    if (!customPrompt) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'prompt is required' },
+      });
+    }
+
+    const selectedStyle = String(style || '').trim();
+    const selectedSize = String(mediaSize || '1080x1080').trim();
+    const effectivePrompt = [
+      customPrompt,
+      selectedStyle ? `Visual style: ${selectedStyle}` : '',
+      selectedSize ? `Output size hint: ${selectedSize}` : '',
+    ]
+      .filter(Boolean)
+      .join('. ');
+
+    const mediaSizeToAspect = (size) => {
+      const s = String(size || '').toLowerCase();
+      if (s.includes('1080x1920') || s.includes('9:16')) return '9:16';
+      if (s.includes('1920x1080') || s.includes('16:9') || s.includes('1200x627')) return '16:9';
+      if (s.includes('1080x1080') || s.includes('1:1')) return '1:1';
+      return '1:1';
+    };
+    const aspectRatio = mediaSizeToAspect(selectedSize);
+
+    if (creativeType === 'image') {
+      if (!env.GCP_PROJECT_ID) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'VERTEX_NOT_CONFIGURED',
+            message: 'GCP_PROJECT_ID is required for Vertex AI image generation.',
+          },
+        });
+      }
+      const imageUrl = await generateVertexAdImageWithRetry(effectivePrompt, aspectRatio, 3);
+      return res.json({
+        success: true,
+        data: {
+          type: 'image',
+          imageUrl,
+          aspectRatio,
+          mediaSize: selectedSize,
+        },
+      });
+    }
+
+    const duration = Number.isFinite(Number(durationSec)) ? Math.max(4, Math.min(180, Number(durationSec))) : 12;
+    const job = await aiRuntime.createVideoJob({
+      prompt: effectivePrompt,
+      websiteUrl: websiteUrl || null,
+      brandName: brandName || 'SalesPal',
+      objective: objective || 'Awareness',
+      locale: locale || 'en',
+      durationSec: duration,
+      aspectRatio,
+      referenceImageUrl: referenceImageUrl || null,
+      orgId,
+      userId: req.user.id,
+    });
+    aiRuntime.enqueueVideoJob(job.jobId, { orgId, durationSec: duration, aspectRatio, referenceImageUrl });
+
+    return res.status(202).json({
+      success: true,
+      data: {
+        type: 'video',
+        jobId: job.jobId,
+        status: job.status,
+        durationSec: duration,
+        aspectRatio,
+        mediaSize: selectedSize,
+      },
+    });
+  } catch (error) {
+    console.error('[generateCustomCreative] Error:', error.message);
+    return res.status(502).json({
+      success: false,
+      error: {
+        code: error?.code || 'CUSTOM_CREATIVE_GENERATION_FAILED',
+        message: error?.message || 'Custom creative generation failed',
+      },
+    });
+  }
+}
+
 module.exports = {
   listCampaigns,
   getCampaign,
@@ -1294,6 +1406,7 @@ module.exports = {
   analyzeBusiness,
   generateAds,
   generateAdImage: generateAdImageHandler,
+  generateCustomCreative,
   listSocialStudioPosts,
   createSocialStudioPost,
   approveSocialStudioPost,

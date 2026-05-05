@@ -11,10 +11,48 @@ const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 const { parseNaturalScheduleUtcIso } = require('../utils/leadScheduleTz');
+const { resolveLocaleFromDialCode } = require('../utils/voiceLocaleResolver');
+
+const HARD_BLOCK_PATTERNS = [
+  /\b(stop|do not call|don't call|unsubscribe|opt[-\s]?out)\b/i,
+  /\b(bhenchod|madarchod|fuck you|bastard|harami|bc|mc)\b/i,
+];
+const SOFT_LOW_INTENT_PATTERNS = [/\btimepass|just checking|just browsing|not interested now\b/i];
+const SERIOUS_INCIDENT_PATTERNS = [/\blegal notice|consumer court|police complaint|harassment complaint|fraud\b/i];
+
+function classifyComplianceFromUtterance(text) {
+  const t = String(text || '').trim();
+  if (!t) return { mode: 'clear', reason: '' };
+  if (HARD_BLOCK_PATTERNS.some((p) => p.test(t))) {
+    const optOut = /\b(stop|do not call|don't call|unsubscribe|opt[-\s]?out)\b/i.test(t);
+    return { mode: 'hard_block', reason: optOut ? 'user_opt_out' : 'explicit_abuse', serious: true };
+  }
+  if (SERIOUS_INCIDENT_PATTERNS.some((p) => p.test(t))) {
+    return { mode: 'serious_incident', reason: 'legal_or_sensitive_complaint', serious: true };
+  }
+  if (SOFT_LOW_INTENT_PATTERNS.some((p) => p.test(t))) {
+    return { mode: 'soft_low_intent', reason: 'low_intent_timepass', serious: false };
+  }
+  return { mode: 'clear', reason: '' };
+}
 
 async function getOrgId(userId) {
   const { rows } = await db.query(`SELECT org_id FROM org_members WHERE user_id = $1 LIMIT 1`, [userId]);
   return rows[0]?.org_id || null;
+}
+
+async function resolveLeadVoiceProfile(leadId, orgId) {
+  if (!leadId || !orgId) return { gender: 'unknown', timezone: '' };
+  try {
+    const { rows } = await db.query(`SELECT metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [leadId, orgId]);
+    const md = rows[0]?.metadata && typeof rows[0].metadata === 'object' ? rows[0].metadata : {};
+    const rawGender = String(md.voiceGender || md.gender || md.sex || '').toLowerCase();
+    const gender = rawGender === 'male' || rawGender === 'female' ? rawGender : 'unknown';
+    const timezone = String(md.leadTimezone || md.timezone || '').trim();
+    return { gender, timezone };
+  } catch {
+    return { gender: 'unknown', timezone: '' };
+  }
 }
 
 /**
@@ -437,7 +475,18 @@ async function voiceTts(req, res, next) {
 
 async function startVoiceSession(req, res, next) {
   try {
-    const { leadId, phone, name, locale, brandId, mode, openerContext, projectId, agentName } = req.body || {};
+    const {
+      leadId,
+      phone,
+      name,
+      locale,
+      brandId,
+      mode,
+      openerContext,
+      projectId,
+      agentName,
+      voiceGenderDetected,
+    } = req.body || {};
     const effectiveBrandId = String(
       brandId || (req.user?.id ? `web-${req.user.id}` : 'web-demo')
     );
@@ -445,6 +494,14 @@ async function startVoiceSession(req, res, next) {
     const userId = req.user?.id || null;
     const orgId =
       membershipOrgId || (req.user?.id && leadId ? await resolveEffectiveOrgIdForVoice(req.user.id, leadId, null) : null);
+    const leadProfile = await resolveLeadVoiceProfile(leadId, orgId);
+    const autoLocale = resolveLocaleFromDialCode(phone);
+    const effectiveLocale = String(locale || '').trim() || autoLocale || 'en';
+    const genderDetected = String(voiceGenderDetected || '').toLowerCase();
+    const voiceGender =
+      genderDetected === 'male' || genderDetected === 'female'
+        ? genderDetected
+        : leadProfile.gender || 'unknown';
 
     if (!phone && !leadId) {
       return res.status(400).json({
@@ -456,11 +513,12 @@ async function startVoiceSession(req, res, next) {
       leadId,
       phone,
       name,
-      locale: locale || 'hing',
+      locale: effectiveLocale,
       mode,
       openerContext: openerContext || '',
       projectId: projectId || null,
       agentName: agentName || 'SalesPal AI',
+      voiceGender,
       orgId,
       userId,
     });
@@ -471,6 +529,8 @@ async function startVoiceSession(req, res, next) {
       lead_id: session.leadId,
       conversation_id: session.conversationId,
       locale_effective: session.locale,
+      voice_gender_effective: voiceGender,
+      control_mode: session?.metadata?.humanTakeoverActive ? 'human' : 'ai',
       assistant_reply: opener,
       telephony,
       voice_tts,
@@ -505,6 +565,51 @@ async function voiceTurn(req, res, next) {
     const orgId =
       membershipOrgId ||
       (req.user?.id && leadId ? await resolveEffectiveOrgIdForVoice(req.user.id, leadId, null) : null);
+    const compliance = classifyComplianceFromUtterance(text);
+
+    const ensureVoiceActionsTable = async () => {
+      await db.query(
+        `CREATE TABLE IF NOT EXISTS ai_voice_actions (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          conversation_id TEXT NOT NULL,
+          org_id UUID,
+          user_id UUID,
+          action_type TEXT NOT NULL,
+          payload JSONB NOT NULL DEFAULT '{}',
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )`
+      );
+    };
+
+    if (compliance.mode === 'hard_block' && conversationId && orgId && userId) {
+      await ensureVoiceActionsTable();
+      await aiRuntime.mergeVoiceSessionMetadata(
+        conversationId,
+        {
+          humanTakeoverActive: true,
+          aiSuppressedByCompliance: true,
+          complianceMode: 'hard_block',
+          complianceReason: compliance.reason,
+        },
+        { orgId, userId }
+      );
+      await db.query(
+        `INSERT INTO ai_voice_actions (conversation_id, org_id, user_id, action_type, payload)
+         VALUES ($1,$2,$3,'compliance_hard_block',$4::jsonb)`,
+        [conversationId, orgId, userId, JSON.stringify({ reason: compliance.reason, text: String(text || '').slice(0, 500) })]
+      );
+      return res.json({
+        status: 'ok',
+        conversation_id: conversationId,
+        assistant_reply:
+          compliance.reason === 'user_opt_out'
+            ? 'Understood. I will stop AI outreach for this conversation immediately.'
+            : 'I am pausing this AI conversation now and marking it for human handling.',
+        control_mode: 'human',
+        compliance,
+        done: true,
+      });
+    }
     const actions = detectVoiceHandshakeActions(text);
     let supervisorPrefix = '';
 
@@ -532,18 +637,10 @@ async function voiceTurn(req, res, next) {
     let scheduledAutomation = null;
     let whatsappDispatch = null;
 
+    if (actions.length || compliance.mode !== 'clear') {
+      await ensureVoiceActionsTable();
+    }
     if (actions.length) {
-      await db.query(
-        `CREATE TABLE IF NOT EXISTS ai_voice_actions (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          conversation_id TEXT NOT NULL,
-          org_id UUID,
-          user_id UUID,
-          action_type TEXT NOT NULL,
-          payload JSONB NOT NULL DEFAULT '{}',
-          created_at TIMESTAMPTZ DEFAULT NOW()
-        )`
-      );
       for (const a of actions) {
         await db.query(
           `INSERT INTO ai_voice_actions (conversation_id, org_id, user_id, action_type, payload)
@@ -551,6 +648,14 @@ async function voiceTurn(req, res, next) {
           [session.conversationId, orgId, userId, a.type, JSON.stringify(a.payload || {})]
         );
       }
+    }
+
+    if (compliance.mode !== 'clear' && conversationId && orgId && userId) {
+      await db.query(
+        `INSERT INTO ai_voice_actions (conversation_id, org_id, user_id, action_type, payload)
+         VALUES ($1,$2,$3,'compliance_incident',$4::jsonb)`,
+        [conversationId, orgId, userId, JSON.stringify({ mode: compliance.mode, reason: compliance.reason, text: String(text || '').slice(0, 500) })]
+      );
     }
 
     if (actions.some((a) => a.type === 'send_brochure_whatsapp') && orgId && userId && session?.leadId) {
@@ -684,18 +789,83 @@ async function voiceTurn(req, res, next) {
         }
       }
     }
+    let complianceAssistantNote = '';
+    if (compliance.mode === 'soft_low_intent') {
+      complianceAssistantNote = ' No worries — I can keep this brief and follow up only when you prefer.';
+    }
+    if (compliance.mode === 'serious_incident') {
+      complianceAssistantNote = ' I am sorry for the inconvenience. I have flagged this for owner review and can arrange a human callback if needed.';
+      if (whatsappService.isWhatsAppEnabled() && session?.phone) {
+        const ji = honorificNameJi(String(session.name || '').trim()) || 'Ji';
+        await whatsappService
+          .sendWhatsAppText({
+            to: session.phone,
+            text: `Namaskar ${ji}, we are sorry for the inconvenience. Your concern has been flagged to our manager. Reply "CALL BACK" if you want a human callback.`,
+          })
+          .catch(() => {});
+      }
+      if (env.ownerWhatsappMsisdn && whatsappService.isWhatsAppEnabled()) {
+        await whatsappService
+          .sendWhatsAppText({
+            to: env.ownerWhatsappMsisdn,
+            text: `SalesPal compliance alert: serious voice incident (${compliance.reason}) for conversation ${session.conversationId}.`,
+          })
+          .catch(() => {});
+      }
+    }
+
     res.json({
       status: 'ok',
       brand_id: session.brandId,
       lead_id: session.leadId,
       conversation_id: session.conversationId,
-      assistant_reply: assistantReply,
+      assistant_reply: `${assistantReply || ''}${complianceAssistantNote}`.trim(),
       state: session.state,
       done: session.state === 'complete',
+      control_mode: session?.metadata?.humanTakeoverActive ? 'human' : 'ai',
+      compliance,
       fact_source: factSource || null,
       actions,
       scheduledAutomation,
       whatsapp_dispatch: whatsappDispatch,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function moderateRealtimeVoice(req, res, next) {
+  try {
+    const { conversationId, text } = req.body || {};
+    const verdict = classifyComplianceFromUtterance(text);
+    if (verdict.mode === 'hard_block' && conversationId) {
+      const orgId = req.user?.id ? await getOrgId(req.user.id) : null;
+      const userId = req.user?.id || null;
+      if (orgId && userId) {
+        await aiRuntime.mergeVoiceSessionMetadata(
+          conversationId,
+          {
+            humanTakeoverActive: true,
+            aiSuppressedByCompliance: true,
+            complianceMode: 'hard_block',
+            complianceReason: verdict.reason,
+          },
+          { orgId, userId }
+        );
+      }
+      await db
+        .query(
+          `INSERT INTO ai_voice_actions (conversation_id, org_id, user_id, action_type, payload)
+           VALUES ($1,$2,$3,'realtime_compliance_block',$4::jsonb)`,
+          [conversationId, orgId, userId, JSON.stringify({ reason: verdict.reason, text: String(text || '').slice(0, 500) })]
+        )
+        .catch(() => {});
+    }
+    res.json({
+      ok: true,
+      compliance: verdict,
+      block_now: verdict.mode === 'hard_block',
+      control_mode: verdict.mode === 'hard_block' ? 'human' : 'ai',
     });
   } catch (err) {
     next(err);
@@ -753,6 +923,68 @@ async function voiceHistory(req, res, next) {
       turns: session.turns,
       turn_count: session.turns.length,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function voiceActions(req, res, next) {
+  try {
+    const { conversationId } = req.query || {};
+    if (!conversationId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'conversationId is required' } });
+    }
+    const orgId = req.user?.id ? await getOrgId(req.user.id) : null;
+    const userId = req.user?.id || null;
+    try {
+      const { rows } = await db.query(
+        `SELECT id, action_type, payload, created_at
+         FROM ai_voice_actions
+         WHERE conversation_id = $1
+           AND ($2::uuid IS NULL OR org_id = $2::uuid)
+           AND ($3::uuid IS NULL OR user_id = $3::uuid OR user_id IS NULL)
+         ORDER BY created_at DESC
+         LIMIT 100`,
+        [conversationId, orgId, userId]
+      );
+      return res.json({ conversation_id: conversationId, events: rows || [] });
+    } catch (e) {
+      // Table may not exist yet in older deployments.
+      if (/ai_voice_actions/i.test(String(e?.message || ''))) {
+        return res.json({ conversation_id: conversationId, events: [] });
+      }
+      throw e;
+    }
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function setVoiceConversationTakeover(req, res, next) {
+  try {
+    const { conversationId, mode } = req.body || {};
+    if (!conversationId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'conversationId is required' } });
+    }
+    const normalizedMode = String(mode || 'human').toLowerCase();
+    const human = normalizedMode !== 'ai';
+    const orgId = req.user?.id ? await getOrgId(req.user.id) : null;
+    const userId = req.user?.id || null;
+    await aiRuntime.mergeVoiceSessionMetadata(
+      conversationId,
+      {
+        humanTakeoverActive: human,
+        humanTakeoverAt: new Date().toISOString(),
+        humanTakeoverBy: userId || null,
+      },
+      { orgId, userId }
+    );
+    await db.query(
+      `INSERT INTO ai_voice_actions (conversation_id, org_id, user_id, action_type, payload)
+       VALUES ($1,$2,$3,$4,$5::jsonb)`,
+      [conversationId, orgId, userId, human ? 'human_takeover' : 'ai_resumed', JSON.stringify({ mode: human ? 'human' : 'ai' })]
+    ).catch(() => {});
+    res.json({ ok: true, conversationId, control_mode: human ? 'human' : 'ai' });
   } catch (err) {
     next(err);
   }
@@ -885,7 +1117,10 @@ module.exports = {
   voiceTts,
   voiceSttTranscribe,
   voiceTurn,
+  setVoiceConversationTakeover,
+  moderateRealtimeVoice,
   voiceHistory,
+  voiceActions,
   summarizeVoice,
   ownerVoiceSummary,
   createVideoJob,

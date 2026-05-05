@@ -47,7 +47,22 @@ router.post(
   ctrl.startVoiceSession
 );
 router.post('/voice/session/turn', aiLimiter, [body('text').notEmpty().withMessage('text is required')], validate, ctrl.voiceTurn);
+router.post(
+  '/voice/session/realtime-moderate',
+  aiLimiter,
+  [body('conversationId').notEmpty().withMessage('conversationId is required'), body('text').notEmpty().withMessage('text is required')],
+  validate,
+  ctrl.moderateRealtimeVoice
+);
+router.post(
+  '/voice/session/takeover',
+  aiLimiter,
+  [body('conversationId').notEmpty().withMessage('conversationId is required'), body('mode').optional().isIn(['ai', 'human'])],
+  validate,
+  ctrl.setVoiceConversationTakeover
+);
 router.get('/voice/session/history', aiLimiter, ctrl.voiceHistory);
+router.get('/voice/session/actions', aiLimiter, ctrl.voiceActions);
 router.post('/voice/session/summary', aiLimiter, ctrl.summarizeVoice);
 router.get('/voice/owner-summary', aiLimiter, ctrl.ownerVoiceSummary);
 router.post('/video/jobs', aiLimiter, ctrl.createVideoJob);

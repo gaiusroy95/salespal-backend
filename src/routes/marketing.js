@@ -30,6 +30,7 @@ router.post('/campaigns/:id/sync-performance', [param('id').isUUID()], validate,
 router.post('/ai-analyze', upload.any(), ctrl.analyzeBusiness);
 router.post('/generate-ads', ctrl.generateAds);
 router.post('/generate-ad-image', ctrl.generateAdImage);
+router.post('/custom-generate', ctrl.generateCustomCreative);
 
 // Social Studio (staging -> approval -> publish)
 router.get('/social-studio/posts', ctrl.listSocialStudioPosts);

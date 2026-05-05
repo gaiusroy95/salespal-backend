@@ -758,9 +758,34 @@ async function generateAds(req, res) {
       numberOfImages: reqNumImages,
       selectedAdFormat: rawAdFormat,
       carouselSlides: rawCarouselSlides,
+      style: rawStyle,
+      mediaSize: rawMediaSize,
+      enableAudio: rawEnableAudio,
+      enableSubtitles: rawEnableSubtitles,
+      subtitleText: rawSubtitleText,
+      customScript: rawCustomScript,
+      connectTarget: rawConnectTarget,
+      projectId: rawProjectId,
     } = req.body;
 
     const selectedAdFormat = String(rawAdFormat || 'image').toLowerCase();
+    const selectedStyle = String(rawStyle || '').trim() || 'Tech';
+    const selectedMediaSize = String(rawMediaSize || '').trim() || '1080x1080';
+    const enableAudio = Boolean(rawEnableAudio);
+    const enableSubtitles = Boolean(rawEnableSubtitles);
+    const subtitleText = String(rawSubtitleText || '').trim();
+    const connectTarget = String(rawConnectTarget || 'none').trim().toLowerCase();
+    const projectId = rawProjectId || null;
+    const parsedCustomScript =
+      rawCustomScript && typeof rawCustomScript === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(rawCustomScript);
+            } catch {
+              return null;
+            }
+          })()
+        : (rawCustomScript && typeof rawCustomScript === 'object' ? rawCustomScript : null);
 
     const numberOfImages = Math.min(Math.max(parseInt(reqNumImages, 10) || 1, 1), 4);
     const carouselSlides = Math.min(Math.max(parseInt(String(rawCarouselSlides ?? ''), 10) || 6, 4), 8);
@@ -777,7 +802,45 @@ async function generateAds(req, res) {
       numberOfImages,
       selectedAdFormat,
       slideCount,
+      selectedStyle,
+      selectedMediaSize,
+      enableAudio,
+      enableSubtitles,
+      hasCustomScript: !!parsedCustomScript,
+      connectTarget,
     });
+
+    const normalizedFromScript = {
+      style:
+        typeof parsedCustomScript?.style === 'string' && parsedCustomScript.style.trim()
+          ? parsedCustomScript.style.trim()
+          : selectedStyle,
+      mediaSize:
+        typeof parsedCustomScript?.size === 'string' && parsedCustomScript.size.trim()
+          ? parsedCustomScript.size.trim()
+          : selectedMediaSize,
+      enableAudio:
+        typeof parsedCustomScript?.includeAudio === 'boolean'
+          ? parsedCustomScript.includeAudio
+          : enableAudio,
+      enableSubtitles:
+        typeof parsedCustomScript?.includeSubtitles === 'boolean'
+          ? parsedCustomScript.includeSubtitles
+          : enableSubtitles,
+      subtitleText:
+        typeof parsedCustomScript?.subtitleText === 'string' && parsedCustomScript.subtitleText.trim()
+          ? parsedCustomScript.subtitleText.trim()
+          : subtitleText,
+    };
+
+    const mediaSizeToAspect = (size) => {
+      const s = String(size || '').toLowerCase();
+      if (s.includes('1080x1920') || s.includes('9:16')) return '9:16';
+      if (s.includes('1920x1080') || s.includes('16:9')) return '16:9';
+      if (s.includes('1200x627')) return '16:9';
+      if (s.includes('1080x1080') || s.includes('1:1')) return '1:1';
+      return null;
+    };
 
     // Build business context for Gemini
     const businessContext = {
@@ -795,6 +858,15 @@ async function generateAds(req, res) {
       },
       selectedPlatforms: platforms || ['google', 'meta'],
       campaignTypes: selectedCampaigns || [],
+      creativeCustomization: {
+        style: normalizedFromScript.style,
+        mediaSize: normalizedFromScript.mediaSize,
+        enableAudio: normalizedFromScript.enableAudio,
+        enableSubtitles: normalizedFromScript.enableSubtitles,
+        subtitleText: normalizedFromScript.subtitleText,
+        connectTarget,
+        customScript: parsedCustomScript,
+      },
     };
 
     if (!env.GCP_PROJECT_ID) {
@@ -895,6 +967,8 @@ async function generateAds(req, res) {
         if (platform.includes('instagram')) aspectRatio = '4:5';
         if (platform.includes('google')) aspectRatio = '1:1';
         if (platform.includes('meta')) aspectRatio = '1:1';
+        const ratioFromSize = mediaSizeToAspect(normalizedFromScript.mediaSize);
+        if (ratioFromSize) aspectRatio = ratioFromSize;
 
         const productOrService = businessContext.products?.slice(0, 3).join(', ') || businessContext.industry;
         const industry = businessContext.industry || 'Business';
@@ -904,8 +978,8 @@ async function generateAds(req, res) {
           tone: 'Professional and highly appealing',
           style:
             selectedAdFormat === 'video'
-              ? 'Cinematic commercial scene with natural human activity and realistic movement cues'
-              : 'Modern commercial photography',
+              ? `Cinematic commercial scene with natural human activity and realistic movement cues; visual style: ${normalizedFromScript.style}`
+              : `Modern commercial photography; visual style: ${normalizedFromScript.style}`,
           colors: analysisData?.logo ? 'Brand accurate colors' : 'Vibrant and balanced',
           productOrService,
           platform,
@@ -921,6 +995,11 @@ async function generateAds(req, res) {
             analysisData?.websiteUrl,
             analysisData?.keyDifferentiators?.join(' '),
             productOrService,
+            `Desired output size: ${normalizedFromScript.mediaSize}`,
+            normalizedFromScript.enableAudio ? 'Video audio requested by user' : 'No audio requested',
+            normalizedFromScript.enableSubtitles
+              ? `Subtitles requested${normalizedFromScript.subtitleText ? ` (${normalizedFromScript.subtitleText})` : ''}`
+              : 'No subtitles requested',
           ]
             .filter(Boolean)
             .join(' | '),
@@ -938,6 +1017,10 @@ async function generateAds(req, res) {
         for (let i = 0; i < countForCampaign; i++) {
           console.log(`[generateAds]   Slide ${i + 1}/${countForCampaign}...`);
           let currentPrompt = prompts[i % prompts.length];
+          if (parsedCustomScript && typeof parsedCustomScript === 'object') {
+            const scriptText = JSON.stringify(parsedCustomScript);
+            currentPrompt = `${currentPrompt}, apply custom creative script guidance: ${scriptText.slice(0, 1500)}`;
+          }
           if (siteEnvironment === 'farmland') {
             currentPrompt = `${currentPrompt}, ONLY depict farmland/open plots/rural terrain, absolutely no skyscrapers, no high-rise buildings, no city skyline`;
           }
@@ -967,7 +1050,87 @@ async function generateAds(req, res) {
         campaign.description = campaign.primaryText || campaign.descriptions?.[0] || '';
         campaign.generatedAdFormat = selectedAdFormat;
         campaign.videoFromSlides = selectedAdFormat === 'video';
+        campaign.connectTarget = connectTarget;
+        campaign.customization = {
+          style: normalizedFromScript.style,
+          mediaSize: normalizedFromScript.mediaSize,
+          enableAudio: normalizedFromScript.enableAudio,
+          enableSubtitles: normalizedFromScript.enableSubtitles,
+          subtitleText: normalizedFromScript.subtitleText || null,
+          connectTarget,
+        };
       }
+
+      // Optional linkage persistence requested by frontend:
+      // - social_post: stage generated creatives into social_studio_posts
+      // - campaign: save a campaign_draft containing generated ads + settings
+      const linkage = { target: connectTarget, created: [] };
+      if (connectTarget === 'social_post' && orgId) {
+        for (const campaign of result.campaigns) {
+          const mediaUrl =
+            (Array.isArray(campaign.images) && campaign.images[0]) ||
+            campaign.image ||
+            campaign.imageUrl ||
+            null;
+          const title = String(campaign.campaignName || campaign.campaignTitle || 'Generated Creative').slice(0, 180);
+          const body =
+            String(
+              campaign.primaryText ||
+              campaign.descriptions?.[0] ||
+              campaign.description ||
+              campaign.headlines?.[0] ||
+              ''
+            ).slice(0, 3000);
+          const md = {
+            source: 'generate-ads',
+            generatedAdFormat: selectedAdFormat,
+            customization: campaign.customization || {},
+            platform: campaign.platform || null,
+            connectTarget,
+            customScript: parsedCustomScript || null,
+          };
+          const { rows: staged } = await db.query(
+            `INSERT INTO social_studio_posts
+             (org_id, user_id, title, festival, body, media_url, status, metadata)
+             VALUES ($1,$2,$3,$4,$5,$6,'staged',$7::jsonb)
+             RETURNING id`,
+            [orgId, req.user.id, title, null, body || title, mediaUrl, JSON.stringify(md)]
+          );
+          if (staged[0]?.id) linkage.created.push({ type: 'social_studio_post', id: staged[0].id });
+        }
+      } else if (connectTarget === 'campaign' && orgId) {
+        const draftData = {
+          data: {
+            analysisData: analysisData || {},
+            adSettings: {
+              selectedCampaigns,
+              platforms: platforms || [],
+              generatedAds: { campaigns: result.campaigns },
+              selectedAdFormat,
+              videoDurationSec: parsedCustomScript?.durationSec || null,
+              selectedStyle: normalizedFromScript.style,
+              selectedSize: normalizedFromScript.mediaSize,
+              enableAudio: normalizedFromScript.enableAudio,
+              enableSubtitles: normalizedFromScript.enableSubtitles,
+              subtitleText: normalizedFromScript.subtitleText,
+              connectTarget,
+              customScriptJson: parsedCustomScript ? JSON.stringify(parsedCustomScript, null, 2) : null,
+            },
+          },
+          metadata: {
+            source: 'generate-ads',
+            customScript: parsedCustomScript || null,
+          },
+        };
+        const { rows: drafts } = await db.query(
+          `INSERT INTO campaign_drafts (org_id, user_id, project_id, step, wizard_step, draft_data, analysis_done)
+           VALUES ($1,$2,$3,4,4,$4::jsonb,true)
+           RETURNING id`,
+          [orgId, req.user.id, projectId, JSON.stringify(draftData)]
+        );
+        if (drafts[0]?.id) linkage.created.push({ type: 'campaign_draft', id: drafts[0].id });
+      }
+      result.linkage = linkage;
     }
 
     return res.json({

@@ -35,7 +35,10 @@ router.post('/custom-generate', ctrl.generateCustomCreative);
 // Social Studio (staging -> approval -> publish)
 router.get('/social-studio/posts', ctrl.listSocialStudioPosts);
 router.post('/social-studio/posts', ctrl.createSocialStudioPost);
+router.put('/social-studio/posts/:id', [param('id').isUUID()], validate, ctrl.updateSocialStudioPost);
+router.delete('/social-studio/posts/:id', [param('id').isUUID()], validate, ctrl.deleteSocialStudioPost);
 router.post('/social-studio/posts/:id/approve', [param('id').isUUID()], validate, ctrl.approveSocialStudioPost);
 router.post('/social-studio/posts/:id/publish', [param('id').isUUID()], validate, ctrl.publishSocialStudioPost);
+router.post('/social-studio/dispatch-due', ctrl.dispatchDueSocialStudioPosts);
 
 module.exports = router;

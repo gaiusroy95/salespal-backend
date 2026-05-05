@@ -1164,18 +1164,140 @@ async function listSocialStudioPosts(req, res, next) {
   } catch (err) { next(err); }
 }
 
+function normalizeRecurrence(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const enabled = Boolean(raw.enabled);
+  if (!enabled) return null;
+  const frequency = String(raw.frequency || 'daily').toLowerCase();
+  const interval = Math.max(1, Math.min(30, Number(raw.interval || 1) || 1));
+  const weekdays = Array.isArray(raw.weekdays)
+    ? raw.weekdays.map((d) => Number(d)).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+    : [];
+  return {
+    enabled: true,
+    frequency: frequency === 'weekly' ? 'weekly' : 'daily',
+    interval,
+    weekdays,
+  };
+}
+
+function nextRecurringDate(fromDate, recurrence) {
+  const current = new Date(fromDate);
+  if (Number.isNaN(current.getTime())) return null;
+  const next = new Date(current);
+  if (!recurrence?.enabled) return null;
+  if (recurrence.frequency === 'daily') {
+    next.setDate(next.getDate() + recurrence.interval);
+    return next.toISOString();
+  }
+  const weekdays = recurrence.weekdays?.length ? recurrence.weekdays : [current.getDay()];
+  for (let i = 1; i <= 21; i++) {
+    const probe = new Date(current);
+    probe.setDate(current.getDate() + i);
+    if (weekdays.includes(probe.getDay())) {
+      return probe.toISOString();
+    }
+  }
+  next.setDate(next.getDate() + 7 * recurrence.interval);
+  return next.toISOString();
+}
+
 async function createSocialStudioPost(req, res, next) {
   try {
     const orgId = await getOrgId(req.user.id);
-    const { title, festival, body, mediaUrl, scheduledAt } = req.body || {};
+    const {
+      title,
+      festival,
+      body,
+      mediaUrl,
+      scheduledAt,
+      content,
+      postType,
+      status,
+      platforms,
+      mediaUrls,
+      recurrence,
+    } = req.body || {};
+    const normalizedRecurrence = normalizeRecurrence(recurrence);
+    const scheduledIso = scheduledAt || req.body?.scheduledFor || null;
+    const effectiveStatus = String(status || (scheduledIso ? 'scheduled' : 'draft')).toLowerCase();
+    const md = {
+      platforms: Array.isArray(platforms) ? platforms : [],
+      post_type: String(postType || 'image').toLowerCase(),
+      media_urls: Array.isArray(mediaUrls) ? mediaUrls : [],
+      recurrence: normalizedRecurrence,
+    };
     const { rows } = await db.query(
       `INSERT INTO social_studio_posts
        (org_id, user_id, title, festival, body, media_url, status, scheduled_at, metadata)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
-      [orgId, req.user.id, title || 'Festival Post', festival || null, body || '', mediaUrl || null, 'staged', scheduledAt || null, '{}']
+      [
+        orgId,
+        req.user.id,
+        title || 'Social Post',
+        festival || null,
+        body || content || '',
+        mediaUrl || (Array.isArray(mediaUrls) ? mediaUrls[0] : null) || null,
+        effectiveStatus,
+        scheduledIso,
+        JSON.stringify(md),
+      ]
     );
     res.status(201).json(rows[0]);
+  } catch (err) { next(err); }
+}
+
+async function updateSocialStudioPost(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    const { rows: foundRows } = await db.query(
+      `SELECT * FROM social_studio_posts WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [req.params.id, orgId]
+    );
+    const row = foundRows[0];
+    if (!row) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Post not found' } });
+    const b = req.body || {};
+    const recurrence = normalizeRecurrence(b.recurrence ?? row.metadata?.recurrence);
+    const nextMd = {
+      ...(row.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
+      ...(b.platforms ? { platforms: b.platforms } : {}),
+      ...(b.postType ? { post_type: String(b.postType).toLowerCase() } : {}),
+      ...(b.mediaUrls ? { media_urls: b.mediaUrls } : {}),
+      recurrence,
+    };
+    const { rows } = await db.query(
+      `UPDATE social_studio_posts
+       SET title = COALESCE($1, title),
+           body = COALESCE($2, body),
+           media_url = COALESCE($3, media_url),
+           status = COALESCE($4, status),
+           scheduled_at = COALESCE($5, scheduled_at),
+           metadata = $6::jsonb,
+           updated_at = NOW()
+       WHERE id = $7 AND org_id = $8
+       RETURNING *`,
+      [
+        b.title ?? null,
+        b.body ?? b.content ?? null,
+        b.mediaUrl ?? (Array.isArray(b.mediaUrls) ? b.mediaUrls[0] : null) ?? null,
+        b.status ?? null,
+        b.scheduledAt ?? b.scheduledFor ?? null,
+        JSON.stringify(nextMd),
+        req.params.id,
+        orgId,
+      ]
+    );
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+}
+
+async function deleteSocialStudioPost(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    const { rowCount } = await db.query(`DELETE FROM social_studio_posts WHERE id = $1 AND org_id = $2`, [req.params.id, orgId]);
+    if (!rowCount) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Post not found' } });
+    res.json({ ok: true });
   } catch (err) { next(err); }
 }
 
@@ -1206,6 +1328,57 @@ async function publishSocialStudioPost(req, res, next) {
     );
     if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Post not found' } });
     res.json({ ...rows[0], publishResult: { ok: true, simulated: true } });
+  } catch (err) { next(err); }
+}
+
+async function dispatchDueSocialStudioPosts(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    const limit = Math.max(1, Math.min(100, Number(req.body?.limit || 25)));
+    const { rows: dueRows } = await db.query(
+      `SELECT * FROM social_studio_posts
+       WHERE org_id = $1
+         AND status IN ('scheduled', 'approved')
+         AND scheduled_at IS NOT NULL
+         AND scheduled_at <= NOW()
+       ORDER BY scheduled_at ASC
+       LIMIT $2`,
+      [orgId, limit]
+    );
+    const published = [];
+    for (const post of dueRows) {
+      const recurrence = normalizeRecurrence(post?.metadata?.recurrence);
+      if (recurrence?.enabled) {
+        const nextAt = nextRecurringDate(post.scheduled_at, recurrence);
+        const nextMd = {
+          ...(post.metadata && typeof post.metadata === 'object' ? post.metadata : {}),
+          last_auto_published_at: new Date().toISOString(),
+          recurrence,
+        };
+        const { rows } = await db.query(
+          `UPDATE social_studio_posts
+           SET status = 'scheduled',
+               published_at = NOW(),
+               scheduled_at = $1,
+               metadata = $2::jsonb,
+               updated_at = NOW()
+           WHERE id = $3 AND org_id = $4
+           RETURNING *`,
+          [nextAt, JSON.stringify(nextMd), post.id, orgId]
+        );
+        if (rows[0]) published.push(rows[0]);
+      } else {
+        const { rows } = await db.query(
+          `UPDATE social_studio_posts
+           SET status = 'published', published_at = NOW(), updated_at = NOW()
+           WHERE id = $1 AND org_id = $2
+           RETURNING *`,
+          [post.id, orgId]
+        );
+        if (rows[0]) published.push(rows[0]);
+      }
+    }
+    res.json({ dispatched: published.length, posts: published });
   } catch (err) { next(err); }
 }
 
@@ -1409,6 +1582,9 @@ module.exports = {
   generateCustomCreative,
   listSocialStudioPosts,
   createSocialStudioPost,
+  updateSocialStudioPost,
+  deleteSocialStudioPost,
   approveSocialStudioPost,
   publishSocialStudioPost,
+  dispatchDueSocialStudioPosts,
 };

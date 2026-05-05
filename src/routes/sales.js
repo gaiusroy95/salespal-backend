@@ -14,6 +14,10 @@ router.post('/campaigns/:campaignId/website', [
   param('campaignId').isUUID(),
   body('websiteUrl').notEmpty().withMessage('websiteUrl is required'),
 ], validate, ctrl.saveCampaignWebsite);
+router.post('/campaigns/:campaignId/communication-setup', [
+  param('campaignId').isUUID(),
+], validate, ctrl.saveCampaignCommunicationSetup);
+router.get('/campaign-goal-samples', ctrl.listCampaignGoalSamples);
 router.get('/campaigns/:campaignId/leads', [param('campaignId').isUUID()], validate, ctrl.listCampaignLeads);
 router.post('/campaigns/:campaignId/leads', [
   param('campaignId').isUUID(),

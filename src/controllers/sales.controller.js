@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
+const callComplianceService = require('../services/callCompliance.service');
 
 async function getOrgId(userId) {
   const { rows } = await db.query(
@@ -1150,6 +1151,137 @@ async function saveCampaignWebsite(req, res, next) {
   }
 }
 
+async function listCampaignGoalSamples(req, res, next) {
+  try {
+    return res.json({
+      samples: [
+        { id: 'lead_qualification', label: 'Lead qualification call', type: 'outbound' },
+        { id: 'site_visit_booking', label: 'Book site visits', type: 'outbound' },
+        { id: 'demo_booking', label: 'Book demo calls', type: 'outbound' },
+        { id: 'renewal_followup', label: 'Renewal follow-up', type: 'outbound' },
+        { id: 'inbound_screening', label: 'Inbound screening and routing', type: 'inbound' },
+      ],
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+function parseTimeWindowValue(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  const m = s.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!m) return null;
+  return `${String(m[1]).padStart(2, '0')}:${m[2]}`;
+}
+
+async function saveCampaignCommunicationSetup(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+
+    const { rows: campaigns } = await db.query(
+      `SELECT id, metadata FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [req.params.campaignId, orgId]
+    );
+    const campaign = campaigns[0];
+    if (!campaign) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+
+    const body = req.body || {};
+    const telephonyProvider = String(body.telephonyProvider || body.telephony_provider || 'tata_smartflo').trim().toLowerCase();
+    if (!['tata', 'tata_smartflo', 'tata smartflo'].includes(telephonyProvider)) {
+      return res.status(400).json({
+        error: {
+          code: 'TELEPHONY_PROVIDER_NOT_ALLOWED',
+          message: 'Only Tata Smartflo is supported for calling campaigns.',
+        },
+      });
+    }
+
+    const campaignType = String(body.campaignType || body.campaign_type || 'outbound').toLowerCase();
+    if (!['inbound', 'outbound'].includes(campaignType)) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'campaignType must be inbound or outbound' } });
+    }
+
+    const callingScript = String(body.callingScript || body.calling_script || '').trim();
+    let complianceStatus = 'not_run';
+    if (callingScript) {
+      try {
+        const compliance = await callComplianceService.scanCallingScript(callingScript);
+        complianceStatus = compliance?.blocked ? 'blocked' : 'passed';
+        if (compliance?.blocked) {
+          return res.status(422).json({
+            error: {
+              code: 'SCRIPT_COMPLIANCE_BLOCKED',
+              message: 'Manual script contains abusive, false, or non-compliant content. Please revise before saving.',
+            },
+            compliance,
+          });
+        }
+      } catch (_) {
+        // Keep campaign setup operational even if scanner is temporarily unavailable.
+        complianceStatus = 'scan_unavailable';
+      }
+    }
+
+    const selectedLanguages = Array.isArray(body.selectedLanguages || body.selected_languages)
+      ? (body.selectedLanguages || body.selected_languages).map((x) => String(x).trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const start = parseTimeWindowValue(body.outboundWindowStart || body.outbound_window_start || '09:00');
+    const end = parseTimeWindowValue(body.outboundWindowEnd || body.outbound_window_end || '21:00');
+    if (!start || !end) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Outbound window must be HH:MM format' } });
+    }
+
+    const baseMd = campaign.metadata && typeof campaign.metadata === 'object' ? campaign.metadata : {};
+    const nextMd = {
+      ...baseMd,
+      calling_enabled: Boolean(body.callingEnabled ?? body.calling_enabled),
+      calling_goal: String(body.callingGoal ?? body.calling_goal ?? ''),
+      calling_goal_sample: String(body.callingGoalSample ?? body.calling_goal_sample ?? ''),
+      calling_audience: String(body.callingAudience ?? body.calling_audience ?? ''),
+      calling_script: callingScript,
+      whatsapp_enabled: Boolean(body.waEnabled ?? body.whatsapp_enabled),
+      whatsapp_goal: String(body.waGoal ?? body.whatsapp_goal ?? ''),
+      whatsapp_offer: String(body.waOffer ?? body.whatsapp_offer ?? ''),
+      whatsapp_message: String(body.waMessage ?? body.whatsapp_message ?? ''),
+      campaign_type: campaignType,
+      telephony_provider: 'tata_smartflo',
+      brain_drive_connected: Boolean(body.brainDriveConnected ?? body.brain_drive_connected),
+      brain_drive_collection: String(body.brainDriveCollection ?? body.brain_drive_collection ?? ''),
+      business_number: String(body.businessNumber ?? body.business_number ?? ''),
+      whatsapp_report_number: String(body.whatsappReportNumber ?? body.whatsapp_report_number ?? ''),
+      language_country: String(body.languageCountry ?? body.language_country ?? 'india'),
+      selected_languages: selectedLanguages,
+      agent_male_name: String(body.agentMaleName ?? body.agent_male_name ?? 'Rahul'),
+      agent_female_name: String(body.agentFemaleName ?? body.agent_female_name ?? 'Priya'),
+      agent_custom_name: String(body.agentCustomName ?? body.agent_custom_name ?? ''),
+      outbound_window_start: start,
+      outbound_window_end: end,
+      logo_enabled: Boolean(body.logoEnabled ?? body.logo_enabled),
+      logo_url: String(body.logoUrl ?? body.logo_url ?? ''),
+      user_media_enabled: Boolean(body.userMediaEnabled ?? body.user_media_enabled),
+      user_media_urls: Array.isArray(body.userMediaUrls ?? body.user_media_urls)
+        ? (body.userMediaUrls ?? body.user_media_urls).map((x) => String(x || '').trim()).filter(Boolean).slice(0, 20)
+        : [],
+      pre_script_required: true,
+      script_compliance_status: complianceStatus,
+      communication_setup_updated_at: new Date().toISOString(),
+    };
+
+    const { rows: updatedRows } = await db.query(
+      `UPDATE campaigns
+       SET metadata = $1::jsonb, updated_at = NOW()
+       WHERE id = $2 AND org_id = $3
+       RETURNING *`,
+      [JSON.stringify(nextMd), req.params.campaignId, orgId]
+    );
+    return res.json(updatedRows[0]);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listDeals,
   getDeal,
@@ -1161,6 +1293,8 @@ module.exports = {
   listLeadActions,
   createSalesCampaign,
   saveCampaignWebsite,
+  saveCampaignCommunicationSetup,
+  listCampaignGoalSamples,
   listCampaignLeads,
   addCampaignLead,
   createAutomationJob,

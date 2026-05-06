@@ -284,6 +284,7 @@ async function launchDraft(req, res, next) {
       const totalDailyBudget = Number(budget.daily || 0);
       const perPlatform = budget.perPlatform || {};
       const split = budget.split || {};
+      const tracking = data.tracking && typeof data.tracking === 'object' ? data.tracking : {};
       const campaignName =
         chosenCampaign.campaignTitle ||
         chosenCampaign.campaignName ||
@@ -338,6 +339,7 @@ async function launchDraft(req, res, next) {
             draft_id: draft.id,
             chosen_campaign: chosenCampaign,
             per_platform_budget: perPlatform,
+            tracking,
           }),
           req.user.id
         ]
@@ -392,6 +394,9 @@ async function publishCampaign(req, res, next) {
 
     const campaign = rows[0];
     const platforms = req.body.platforms || [];
+    const tracking = req.body?.tracking && typeof req.body.tracking === 'object'
+      ? req.body.tracking
+      : {};
     const userId    = req.user.id;
 
     const campaignData = {
@@ -408,6 +413,7 @@ async function publishCampaign(req, res, next) {
       headline:    campaign.headline,
       description: campaign.primary_text,
       keywords:    [],
+      tracking,
     };
 
     const results = {};

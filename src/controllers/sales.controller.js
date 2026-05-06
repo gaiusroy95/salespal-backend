@@ -393,8 +393,35 @@ function zonedDateToUtcIso(year, month, day, hh, mm, timeZone) {
   return new Date(naiveUtc - offset).toISOString();
 }
 
-const CALL_WINDOW_START_HOUR = 9;
-const CALL_WINDOW_END_HOUR = 21; // exclusive
+function parseTimeToHourMinute(value, fallbackHour) {
+  const m = String(value || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!m) return { hh: fallbackHour, mm: 0 };
+  return { hh: Number(m[1]), mm: Number(m[2]) };
+}
+
+function formatWindowTimeLabel(windowPart) {
+  const hh = Number(windowPart?.hh || 0);
+  const mm = Number(windowPart?.mm || 0);
+  const d = new Date(Date.UTC(2000, 0, 1, hh, mm, 0));
+  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+async function getUserSalesCallWindow(userId) {
+  const { rows } = await db.query(
+    `SELECT metadata->'settings'->'sales' AS sales
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const sales = rows[0]?.sales && typeof rows[0].sales === 'object' ? rows[0].sales : {};
+  const start = parseTimeToHourMinute(sales.callStart, DEFAULT_CALL_WINDOW_START_HOUR);
+  const end = parseTimeToHourMinute(sales.callEnd, DEFAULT_CALL_WINDOW_END_HOUR);
+  return { start, end };
+}
+
+const DEFAULT_CALL_WINDOW_START_HOUR = 9;
+const DEFAULT_CALL_WINDOW_END_HOUR = 21; // exclusive
 const OUTBOUND_DND_START_HOUR = 21;
 const OUTBOUND_DND_END_HOUR = 9;
 const WHATSAPP_MAX_RETRY_ATTEMPTS = 4;
@@ -420,22 +447,40 @@ function getZonedParts(dateInput, timeZone = 'Asia/Kolkata') {
   }, {});
 }
 
-function isWithinCallWindow(scheduleAt, timeZone = 'Asia/Kolkata') {
+function isWithinCallWindow(scheduleAt, timeZone = 'Asia/Kolkata', callWindow = null) {
   const z = getZonedParts(scheduleAt, timeZone);
   const hh = Number(z.hour || 0);
-  return hh >= CALL_WINDOW_START_HOUR && hh < CALL_WINDOW_END_HOUR;
+  const mm = Number(z.minute || 0);
+  const nowTotal = hh * 60 + mm;
+  const startObj = callWindow?.start || { hh: DEFAULT_CALL_WINDOW_START_HOUR, mm: 0 };
+  const endObj = callWindow?.end || { hh: DEFAULT_CALL_WINDOW_END_HOUR, mm: 0 };
+  const startTotal = Number(startObj.hh || 0) * 60 + Number(startObj.mm || 0);
+  const endTotal = Number(endObj.hh || 0) * 60 + Number(endObj.mm || 0);
+  if (startTotal < endTotal) return nowTotal >= startTotal && nowTotal < endTotal;
+  if (startTotal > endTotal) return nowTotal >= startTotal || nowTotal < endTotal;
+  return true;
 }
 
-function nextAvailableCallIso(scheduleAt, timeZone = 'Asia/Kolkata') {
+function nextAvailableCallIso(scheduleAt, timeZone = 'Asia/Kolkata', callWindow = null) {
   const z = getZonedParts(scheduleAt, timeZone);
   const y = Number(z.year);
   const m = Number(z.month);
   const d = Number(z.day);
   const hh = Number(z.hour || 0);
-  if (hh < CALL_WINDOW_START_HOUR) {
-    return zonedDateToUtcIso(y, m, d, CALL_WINDOW_START_HOUR, 0, timeZone);
+  const mm = Number(z.minute || 0);
+  const nowTotal = hh * 60 + mm;
+  const startObj = callWindow?.start || { hh: DEFAULT_CALL_WINDOW_START_HOUR, mm: 0 };
+  const endObj = callWindow?.end || { hh: DEFAULT_CALL_WINDOW_END_HOUR, mm: 0 };
+  const startTotal = Number(startObj.hh || 0) * 60 + Number(startObj.mm || 0);
+  const endTotal = Number(endObj.hh || 0) * 60 + Number(endObj.mm || 0);
+  if (startTotal === endTotal) return new Date(scheduleAt).toISOString();
+  if (startTotal < endTotal && nowTotal < startTotal) {
+    return zonedDateToUtcIso(y, m, d, startObj.hh, startObj.mm, timeZone);
   }
-  return zonedDateToUtcIso(y, m, d + 1, CALL_WINDOW_START_HOUR, 0, timeZone);
+  if (startTotal > endTotal && nowTotal < endTotal) {
+    return new Date(scheduleAt).toISOString();
+  }
+  return zonedDateToUtcIso(y, m, d + 1, startObj.hh, startObj.mm, timeZone);
 }
 
 function isWithinOutboundWindow(scheduleAt, timeZone = 'Asia/Kolkata') {
@@ -749,19 +794,21 @@ async function createLeadAction(req, res, next) {
 
     if (!meta.automationJobId && (type === 'call' || type === 'whatsapp')) {
       const leadTimezone = leadRows[0]?.metadata?.timezone || 'Asia/Kolkata';
+      const callWindow = await getUserSalesCallWindow(req.user.id);
       const handshake = inferHandshakeIntent({ type, content, metadata: meta, leadTimezone });
       if (handshake) {
-        if (handshake.targetChannel === 'call' && !isWithinCallWindow(handshake.scheduleAt, leadTimezone)) {
-          const suggestedIso = nextAvailableCallIso(handshake.scheduleAt, leadTimezone);
+        if (handshake.targetChannel === 'call' && !isWithinCallWindow(handshake.scheduleAt, leadTimezone, callWindow)) {
+          const suggestedIso = nextAvailableCallIso(handshake.scheduleAt, leadTimezone, callWindow);
           const requestedAt = new Date(handshake.scheduleAt).toLocaleString('en-US', { timeZone: leadTimezone });
           const suggestedAt = new Date(suggestedIso).toLocaleString('en-US', { timeZone: leadTimezone });
+          const windowLabel = `${formatWindowTimeLabel(callWindow.start)} - ${formatWindowTimeLabel(callWindow.end)}`;
           await db.query(
             `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
              VALUES ($1,$2,'whatsapp',$3,'automation_outside_call_window',$4::jsonb)`,
             [
               leadId,
               req.user.id,
-              `Requested call time ${requestedAt} is outside call hours (9:00 AM - 9:00 PM). Next available slot: ${suggestedAt}.`,
+              `Requested call time ${requestedAt} is outside call hours (${windowLabel}). Next available slot: ${suggestedAt}.`,
               JSON.stringify({
                 title: 'Call time unavailable',
                 sender: 'AI',
@@ -886,12 +933,14 @@ async function createAutomationJob(req, res, next) {
     const { rows: leadRows } = await db.query(`SELECT id, contact_first_name, contact_last_name, metadata FROM leads WHERE id = $1 AND org_id = $2`, [leadId, orgId]);
     if (!leadRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
     const leadTimezone = leadRows[0]?.metadata?.timezone || 'Asia/Kolkata';
-    if (targetChannel === 'call' && !isWithinCallWindow(scheduleDate.toISOString(), leadTimezone)) {
-      const suggestedIso = nextAvailableCallIso(scheduleDate.toISOString(), leadTimezone);
+    const callWindow = await getUserSalesCallWindow(req.user.id);
+    if (targetChannel === 'call' && !isWithinCallWindow(scheduleDate.toISOString(), leadTimezone, callWindow)) {
+      const suggestedIso = nextAvailableCallIso(scheduleDate.toISOString(), leadTimezone, callWindow);
+      const windowLabel = `${formatWindowTimeLabel(callWindow.start)} - ${formatWindowTimeLabel(callWindow.end)}`;
       return res.status(400).json({
         error: {
           code: 'CALL_WINDOW_UNAVAILABLE',
-          message: `Call slots are available 9:00 AM - 9:00 PM (${leadTimezone}). Suggested: ${new Date(suggestedIso).toLocaleString('en-US', { timeZone: leadTimezone })}`,
+          message: `Call slots are available ${windowLabel} (${leadTimezone}). Suggested: ${new Date(suggestedIso).toLocaleString('en-US', { timeZone: leadTimezone })}`,
         },
         suggestion: {
           scheduleAt: suggestedIso,
@@ -947,6 +996,7 @@ async function dispatchDueAutomationJobs(req, res, next) {
   try {
     const orgId = await getOrgId(req.user.id);
     if (!orgId) return res.json({ dispatched: 0, jobs: [] });
+    const callWindow = await getUserSalesCallWindow(req.user.id);
     const limit = Math.max(1, Math.min(100, Number(req.body?.limit || 25)));
     const { rows: jobs } = await db.query(
       `SELECT j.*, l.contact_first_name, l.contact_last_name, l.contact_phone, l.metadata
@@ -1019,6 +1069,16 @@ async function dispatchDueAutomationJobs(req, res, next) {
       }
 
       if (job.target_channel === 'call') {
+        if (!isWithinCallWindow(job.schedule_at, leadTimezone, callWindow)) {
+          const shiftedIso = nextAvailableCallIso(job.schedule_at, leadTimezone, callWindow);
+          await db.query(
+            `UPDATE sales_automation_jobs
+             SET schedule_at = $2::timestamptz, updated_at = NOW()
+             WHERE id = $1`,
+            [job.id, shiftedIso]
+          );
+          continue;
+        }
         try {
           const locale = leadMetadata.preferredLocale || 'hing';
           const projectId = leadMetadata.projectId || null;

@@ -313,6 +313,135 @@ async function callAIWithMessages(chatMessages, systemPrompt, options = {}) {
   }
 }
 
+/**
+ * Gemini JSON-mode generation (parses reliably; avoids brittle regex trimming).
+ */
+async function generateContentJson(systemPrompt, userPrompt, options = {}) {
+  const model = getGeminiModel();
+  if (!model) {
+    const fromParsed = Boolean(String(env.ai.geminiApiKey || '').trim());
+    const fromProcess = Boolean(String(process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim());
+    const error = new Error(
+      `Gemini key is missing in the running backend environment. GOOGLE_GENERATIVE_AI_API_KEY not detected at runtime (parsed=${fromParsed}, processEnv=${fromProcess}).`
+    );
+    error.statusCode = 400;
+    error.code = 'AI_GEMINI_KEY_MISSING';
+    throw error;
+  }
+
+  const temperature =
+    typeof options.temperature === 'number' && options.temperature >= 0 && options.temperature <= 2
+      ? options.temperature
+      : 0.08;
+  const maxTokensRaw = options.maxOutputTokens ?? 8192;
+  const maxOutputTokens = Math.min(Math.max(Number(maxTokensRaw) || 8192, 256), 16384);
+
+  const prompt = `${String(systemPrompt || '')}\n\nUser:\n${String(userPrompt || '')}`;
+
+  try {
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature,
+        maxOutputTokens,
+        responseMimeType: 'application/json',
+      },
+    });
+    const raw = extractAssistantText({ text: result?.response?.text?.() || '' });
+    if (!raw || raw === 'No response generated.') {
+      throw new Error('Gemini returned empty JSON response');
+    }
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      const wrap = new Error(`Failed to parse Gemini JSON: ${String(err.message).slice(0, 200)}`);
+      wrap.statusCode = 502;
+      wrap.code = 'AI_JSON_PARSE_ERROR';
+      throw wrap;
+    }
+    const classified = classifyGeminiError(err);
+    logger.error('Gemini JSON generation error', {
+      code: classified.code,
+      statusCode: classified.statusCode,
+      providerMessage: classified.providerMessage,
+    });
+    const error = new Error(`${classified.userMessage} (${classified.providerMessage})`);
+    error.statusCode = classified.statusCode;
+    error.code = classified.code;
+    throw error;
+  }
+}
+
+/**
+ * Multimodal: inline PDF bytes + prompts → structured JSON object.
+ */
+async function generateJsonWithPdf(systemPrompt, userTextPrompt, pdfBuffer, options = {}) {
+  const model = getGeminiModel();
+  if (!model) {
+    const fromParsed = Boolean(String(env.ai.geminiApiKey || '').trim());
+    const fromProcess = Boolean(String(process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim());
+    const error = new Error(
+      `Gemini key is missing in the running backend environment. GOOGLE_GENERATIVE_AI_API_KEY not detected at runtime (parsed=${fromParsed}, processEnv=${fromProcess}).`
+    );
+    error.statusCode = 400;
+    error.code = 'AI_GEMINI_KEY_MISSING';
+    throw error;
+  }
+
+  const buf = Buffer.isBuffer(pdfBuffer) ? pdfBuffer : Buffer.from(pdfBuffer || []);
+  const b64 = buf.toString('base64');
+
+  const temperature =
+    typeof options.temperature === 'number' && options.temperature >= 0 && options.temperature <= 2
+      ? options.temperature
+      : 0.08;
+  const maxTokensRaw = options.maxOutputTokens ?? 8192;
+  const maxOutputTokens = Math.min(Math.max(Number(maxTokensRaw) || 8192, 256), 16384);
+
+  const head = `${String(systemPrompt || '')}\n\n${String(userTextPrompt || '')}`;
+
+  try {
+    const result = await model.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: head },
+            { inlineData: { mimeType: 'application/pdf', data: b64 } },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature,
+        maxOutputTokens,
+        responseMimeType: 'application/json',
+      },
+    });
+    const raw = extractAssistantText({ text: result?.response?.text?.() || '' });
+    if (!raw || raw === 'No response generated.') {
+      throw new Error('Gemini returned empty JSON response for PDF extraction');
+    }
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      const wrap = new Error(`Failed to parse Gemini PDF JSON: ${String(err.message).slice(0, 200)}`);
+      wrap.statusCode = 502;
+      wrap.code = 'AI_JSON_PARSE_ERROR';
+      throw wrap;
+    }
+    const classified = classifyGeminiError(err);
+    logger.error('Gemini PDF JSON generation error', {
+      code: classified.code,
+      statusCode: classified.statusCode,
+      providerMessage: classified.providerMessage,
+    });
+    const error = new Error(`${classified.userMessage} (${classified.providerMessage})`);
+    error.statusCode = classified.statusCode;
+    error.code = classified.code;
+    throw error;
+  }
+}
+
 module.exports = {
   SYSTEM_PROMPT,
   SALES_CONVERSATION_FUNNEL_BLOCK,
@@ -322,4 +451,6 @@ module.exports = {
   buildStrategicInsightsPrompt,
   callAI,
   callAIWithMessages,
+  generateContentJson,
+  generateJsonWithPdf,
 };

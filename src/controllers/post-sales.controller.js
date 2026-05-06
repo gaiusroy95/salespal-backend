@@ -475,53 +475,37 @@ async function uploadAndAnalyzeCustomers(req, res, next) {
       customers = normalized;
     }
 
-    // Standardize, Validate, and Clean
-    const normalizedRows = customers.map(c => ({
-        name: String(c.name || '').trim(),
-        phone: normalizePhoneNumber(c.phone),
-        email: (c.email || '').toLowerCase().trim() || null,
-        totalAmount: parseAmount(c.totalAmount || c.totalDue || 0),
-        paidAmount: parseAmount(c.paidAmount || c.amountPaid || 0),
-        dueDate: c.dueDate || null,
-      }));
+    // Standardize and clean (keep every row; missing name/phone left blank for the user to complete)
+    let normalizedRows = customers.map((c) => ({
+      name: String(c.name || '').trim(),
+      phone: normalizePhoneNumber(c.phone),
+      email: (c.email || '').toLowerCase().trim() || null,
+      totalAmount: parseAmount(c.totalAmount || c.totalDue || 0),
+      paidAmount: parseAmount(c.paidAmount || c.amountPaid || 0),
+      dueDate: c.dueDate || null,
+    }));
 
-    const invalidRows = normalizedRows.filter(c => !c.name || !c.phone);
-    let processed = normalizedRows.filter(c => c.name && c.phone); // Rule: Must have name AND phone
+    normalizedRows = removeCustomerDuplicates(normalizedRows);
 
-    // Deduplicate by phone
-    processed = removeCustomerDuplicates(processed);
-
-    if (!processed.length) {
-      const sampleKeys = rawRecords?.[0] && typeof rawRecords[0] === 'object'
-        ? Object.keys(rawRecords[0]).slice(0, 12)
-        : [];
-      const missingName = invalidRows.length
-        ? invalidRows.filter((r) => !r.name).length
-        : 0;
-      const missingPhone = invalidRows.length
-        ? invalidRows.filter((r) => !r.phone).length
-        : 0;
-      return res.status(422).json({
-        error: {
-          code: 'NO_VALID_CUSTOMERS_EXTRACTED',
-          message:
-            'AI could not extract valid customer rows. Each row needs at least Name and Phone. Please check your PDF/table text and try again.',
-          details: {
-            rowsParsed: normalizedRows.length,
-            missingNameRows: missingName,
-            missingPhoneRows: missingPhone,
-            sampleInputKeys: sampleKeys,
-          },
+    if (!normalizedRows.length) {
+      normalizedRows = [
+        {
+          name: '',
+          phone: '',
+          email: null,
+          totalAmount: 0,
+          paidAmount: 0,
+          dueDate: null,
         },
-      });
+      ];
     }
 
     res.json({
       success: true,
-      customers: processed,
-      count: processed.length,
+      customers: normalizedRows,
+      count: normalizedRows.length,
       source: isAI ? 'AI' : 'Local',
-      filename: originalname
+      filename: originalname,
     });
 
   } catch (err) {

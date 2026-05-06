@@ -8,15 +8,75 @@ const EXTRACTION_SYSTEM_PROMPT = `You are a strict data extraction engine.
 Return valid JSON only. No markdown, no prose, no code fences.
 Prefer null/empty values when unsure.`;
 
+const MIN_PDF_TEXT_CHARS = 40;
+const PDF_TEXT_SNIPPET_MAX = 120_000;
+
 async function callAiForJson(userPrompt, mode = 'object') {
-  const text = await aiService.callAI(userPrompt, EXTRACTION_SYSTEM_PROMPT);
-  const match = mode === 'array'
-    ? text.match(/\[[\s\S]*\]/)
-    : text.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error('Failed to parse AI JSON response');
+  if (mode === 'array') {
+    const augmented = `${userPrompt}
+
+Respond with ONLY valid JSON in this shape: {"customers":[ ...your array entries... ]}
+Use an empty customers array only when absolutely no contacts exist.
+Each entry must prefer real people/customers found in the document.`;
+    const parsed = await aiService.generateContentJson(EXTRACTION_SYSTEM_PROMPT, augmented, {
+      temperature: 0.08,
+      maxOutputTokens: 8192,
+    });
+    const list = parsed?.customers ?? parsed?.items ?? (Array.isArray(parsed) ? parsed : []);
+    return Array.isArray(list) ? list : [];
   }
-  return JSON.parse(match[0]);
+  return aiService.generateContentJson(EXTRACTION_SYSTEM_PROMPT, userPrompt, {
+    temperature: 0.08,
+    maxOutputTokens: 4096,
+  });
+}
+
+function normalizePdfText(raw) {
+  return String(raw || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Shared shape for spreadsheet-style fields after AI extraction */
+function mapAiCustomerToSpreadsheetShape(c) {
+  return {
+    name: (c.name && String(c.name).trim()) || '',
+    phone: cleanPhone(c.phone || ''),
+    email: parseEmail(c.email || ''),
+    company: (c.company && String(c.company).trim()) || '',
+    totalDue: parseAmount(c.totalDue),
+    amountPaid: parseAmount(c.amountPaid),
+    dueDate: c.dueDate || null,
+    currency: c.currency || 'INR',
+    notes: (c.notes && String(c.notes).trim()) || '',
+    remaining: 0,
+  };
+}
+
+async function fetchCustomersViaPdfVision(pdfBuffer) {
+  const userPrompt = `Read the attached PDF (all pages/tables/lists). Extract EVERY person or customer row that has BOTH a recognizable name AND a mobile/phone number.
+- Names may appear with labels like Customer, Buyer, Patient, Borrower, Name, Party, Subscriber, या हिंदी में नाम/ग्राहक।
+- Phone may be labelled Mobile / Phone / WhatsApp / Contact / टेलीफोन etc. Preserve Indian formats (+91 optional).
+- Rows can be bullet lists or columnar tables — still output one JSON object per person.
+Optional fields only when explicitly present:
+- email, company (or company name), totalDue (number rupees owed), amountPaid (number rupees paid), dueDate ISO YYYY-MM-DD, currency (INR/USD), notes (short).
+
+Return ONLY valid JSON shaped exactly like:
+{"customers":[{"name":"","phone":"","email":"","company":"","totalDue":0,"amountPaid":0,"dueDate":null,"currency":"INR","notes":""}]}
+
+Rules:
+- "phone": include only digits 0–9 (strip spaces/dashes/country separators). Prefer the main mobile/wa number — not invoice IDs.
+- Omit rows where name or phone is missing.
+- Numeric amounts: plain numbers without currency symbols.`;
+
+  const parsed = await aiService.generateJsonWithPdf(EXTRACTION_SYSTEM_PROMPT, userPrompt, pdfBuffer, {
+    temperature: 0.08,
+    maxOutputTokens: 8192,
+  });
+  const list = parsed?.customers ?? parsed?.items ?? [];
+  return Array.isArray(list) ? list : [];
 }
 
 // Extract text from different file types
@@ -63,7 +123,8 @@ const parseAmount = (value) => {
 // Helper function to clean phone number
 const cleanPhone = (phone) => {
   if (!phone) return '';
-  return String(phone).replace(/\D/g, '').slice(-10) || '';
+  const digits = String(phone).replace(/\D/g, '');
+  return digits.slice(-10) || digits || '';
 };
 
 // Helper function to parse email
@@ -286,42 +347,21 @@ const cleanupHeadersWithAI = async (sampleRows) => {
 // Analyze multiple rows from CSV/Excel/text
 const analyzeMultipleCustomers = async (content) => {
   try {
-    const prompt = `Extract every customer from this tabular/unstructured data.
-Return a valid JSON array only. Each item must include:
-{
-  "name": "full customer name",
-  "phone": "only digits (0-9)",
-  "email": "xxx@xxx.com format",
-  "company": "company name",
-  "totalDue": a number (not string),
-  "amountPaid": a number (not string),
-  "dueDate": "YYYY-MM-DD",
-  "currency": "INR or USD",
-  "notes": "any info"
-}
-Data to analyze:
+    const prompt = `Extract every customer or contact person from this document text (tables, lists, invoices, or mixed layout).
+Each row must include at minimum a full name and a phone/mobile number when present in the source.
+- Accept column headers in English or Hindi (e.g. Name, Mobile, ग्राहक, फोन).
+- "phone" must be digits only (0-9) after cleaning; include local 10-digit Indian mobiles or strip +91 to digits.
+Optional when available: email, company, totalDue (number), amountPaid (number), dueDate (YYYY-MM-DD), currency (INR/USD), notes.
+
+Document text:
 ${content}`;
     let customers = await callAiForJson(prompt, 'array');
 
-    // Validate and clean data using improved parsing
     customers = Array.isArray(customers)
       ? customers.map((c) => {
-          let customer = {
-            name: (c.name && c.name.trim()) || '',
-            phone: cleanPhone(c.phone || ''),
-            email: parseEmail(c.email || ''),
-            company: (c.company && c.company.trim()) || '',
-            totalDue: parseAmount(c.totalDue),
-            amountPaid: parseAmount(c.amountPaid),
-            dueDate: c.dueDate || null,
-            currency: c.currency || 'INR',
-            notes: (c.notes && c.notes.trim()) || '',
-            remaining: 0
-          };
+          const customer = mapAiCustomerToSpreadsheetShape(c);
 
-          // Additional regex extraction as fallback for critical fields
           if (!customer.email && c.email === '') {
-            // Try to find email pattern in any field
             const allText = Object.values(c).join(' ');
             const regexEmail = extractEmailFromText(allText);
             if (regexEmail) {
@@ -330,15 +370,12 @@ ${content}`;
           }
 
           if (!customer.amountPaid || customer.amountPaid === 0) {
-            const regexPaid = extractAmountPaidFromText(
-              Object.values(c).join(' ')
-            );
+            const regexPaid = extractAmountPaidFromText(Object.values(c).join(' '));
             if (regexPaid && regexPaid > 0) {
               customer.amountPaid = regexPaid;
             }
           }
 
-          // Calculate remaining due
           customer.remaining = Math.max(0, customer.totalDue - customer.amountPaid);
           return customer;
         })
@@ -380,24 +417,59 @@ const analyzePdfWithGemini = async (pdfBuffer) => {
   try {
     logger.info('Extracting customer data from PDF via AI service...');
     const { text } = await pdfParse(pdfBuffer);
-    if (!text || !text.trim()) return [];
-    let customers = await analyzeMultipleCustomers(text);
-    
-    // Validate and clean customers
+    const normalizedText = normalizePdfText(text || '');
+
+    let customers = [];
+    let source = 'none';
+
+    if (normalizedText.length >= MIN_PDF_TEXT_CHARS) {
+      source = 'text';
+      customers = await analyzeMultipleCustomers(normalizedText.slice(0, PDF_TEXT_SNIPPET_MAX));
+    }
+
+    if (!customers.length) {
+      try {
+        source = normalizedText.length >= MIN_PDF_TEXT_CHARS ? 'vision_fallback' : 'vision';
+        logger.info(
+          `PDF customer extraction (${source}): textLength=${normalizedText.length}, trying Gemini native PDF read`
+        );
+        const rows = await fetchCustomersViaPdfVision(pdfBuffer);
+        customers = Array.isArray(rows)
+          ? rows.map((raw) => {
+              const c = mapAiCustomerToSpreadsheetShape(raw);
+              return {
+                name: c.name,
+                phone: c.phone,
+                email: c.email || '',
+                company: c.company || null,
+                totalAmount: parseAmount(c.totalDue),
+                paidAmount: parseAmount(c.amountPaid),
+                dueDate: c.dueDate || null,
+                currency: 'INR',
+              };
+            })
+          : [];
+      } catch (visionErr) {
+        logger.error('Gemini PDF vision extraction failed:', visionErr);
+        throw visionErr;
+      }
+    }
+
     customers = Array.isArray(customers)
       ? customers.map((c) => ({
-          name: (c.name && c.name.trim()) || '',
+          name: (c.name && String(c.name).trim()) || '',
           phone: cleanPhone(c.phone || ''),
           email: parseEmail(c.email || ''),
-          company: (c.company && c.company.trim()) || null,
+          company: (c.company && String(c.company).trim()) || null,
           totalAmount: parseAmount(c.totalAmount || c.totalDue || 0),
           paidAmount: parseAmount(c.paidAmount || c.amountPaid || 0),
           dueDate: c.dueDate || null,
-          currency: 'INR'
+          currency: 'INR',
         }))
       : [];
 
     customers = removeCustomerDuplicates(customers);
+    logger.info(`PDF extraction complete via ${source}, ${customers.length} row(s) after dedupe`);
     return customers;
   } catch (error) {
     logger.error('Error analyzing PDF with AI service:', error);

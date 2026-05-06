@@ -41,6 +41,21 @@ function normalizeDigits(v) {
   return String(v || '').replace(/[^\d]/g, '');
 }
 
+function extractInboundText(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+  const text = String(msg?.text?.body || '').trim();
+  if (text) return text;
+  const buttonText = String(msg?.button?.text || '').trim();
+  if (buttonText) return buttonText;
+  const interactiveTitle = String(msg?.interactive?.button_reply?.title || '').trim();
+  if (interactiveTitle) return interactiveTitle;
+  const interactiveListTitle = String(msg?.interactive?.list_reply?.title || '').trim();
+  if (interactiveListTitle) return interactiveListTitle;
+  const interactiveListId = String(msg?.interactive?.list_reply?.id || '').trim();
+  if (interactiveListId) return interactiveListId;
+  return '';
+}
+
 function isStopIntent(text) {
   const t = String(text || '').toLowerCase();
   return /\b(stop|unsubscribe|opt[\s-]?out|do not message|don't message|block)\b/.test(t);
@@ -53,13 +68,15 @@ function asksForHuman(text) {
 
 async function findLeadByPhone(phoneDigits) {
   if (!phoneDigits) return null;
+  const last10 = phoneDigits.slice(-10);
   const { rows } = await db.query(
     `SELECT id, org_id, user_id, assigned_to, contact_first_name, contact_last_name, contact_phone, metadata
      FROM leads
      WHERE regexp_replace(COALESCE(contact_phone, ''), '\D', '', 'g') = $1
+        OR RIGHT(regexp_replace(COALESCE(contact_phone, ''), '\D', '', 'g'), 10) = $2
      ORDER BY updated_at DESC
      LIMIT 1`,
-    [phoneDigits]
+    [phoneDigits, last10]
   );
   return rows[0] || null;
 }
@@ -244,6 +261,17 @@ function whatsappVerifyWebhook(req, res) {
 
 async function whatsappInbound(req, res) {
   try {
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS whatsapp_webhook_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        provider TEXT NOT NULL,
+        provider_message_id TEXT UNIQUE NOT NULL,
+        from_phone TEXT,
+        payload JSONB NOT NULL,
+        received_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    );
+
     const payload = req.body && typeof req.body === 'object' ? req.body : {};
     const entries = Array.isArray(payload.entry) ? payload.entry : [];
     for (const entry of entries) {
@@ -252,10 +280,20 @@ async function whatsappInbound(req, res) {
         const value = ch && ch.value && typeof ch.value === 'object' ? ch.value : {};
         const messages = Array.isArray(value.messages) ? value.messages : [];
         for (const msg of messages) {
+          const messageId = String(msg?.id || '').trim();
           const from = normalizeDigits(msg.from || '');
-          const text =
-            String(msg?.text?.body || msg?.button?.text || msg?.interactive?.button_reply?.title || '').trim();
+          const text = extractInboundText(msg);
           if (!from || !text) continue;
+          if (!messageId) continue;
+
+          const dedupe = await db.query(
+            `INSERT INTO whatsapp_webhook_events (provider, provider_message_id, from_phone, payload)
+             VALUES ('meta_whatsapp_cloud', $1, $2, $3::jsonb)
+             ON CONFLICT (provider_message_id) DO NOTHING
+             RETURNING id`,
+            [messageId, from, JSON.stringify(msg)]
+          );
+          if (!dedupe.rows[0]) continue;
 
           const lead = await findLeadByPhone(from);
           if (!lead) continue;
@@ -282,6 +320,10 @@ async function whatsappInbound(req, res) {
               }),
             ]
           );
+          await upsertLeadMetadata(lead.id, {
+            lastInteraction: `Inbound WhatsApp: ${text.slice(0, 180)}`,
+            lastActivityAt: new Date().toISOString(),
+          });
 
           if (isStopIntent(text)) {
             await upsertLeadMetadata(lead.id, {
@@ -290,6 +332,14 @@ async function whatsappInbound(req, res) {
               aiScoreLabel: 'Lost',
               lastInteraction: 'Lead opted out on WhatsApp',
             });
+            await db.query(
+              `UPDATE sales_automation_jobs
+               SET status = 'cancelled', updated_at = NOW()
+               WHERE lead_id = $1
+                 AND status IN ('pending', 'dispatched')
+                 AND target_channel = 'whatsapp'`,
+              [lead.id]
+            );
             if (whatsappService.isWhatsAppEnabled()) {
               await whatsappService.sendWhatsAppText({
                 to: lead.contact_phone || from,
@@ -300,6 +350,13 @@ async function whatsappInbound(req, res) {
           }
 
           if (asksForHuman(text)) {
+            const takeoverUntilIso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+            await upsertLeadMetadata(lead.id, {
+              whatsappHumanTakeoverMode: 'human',
+              whatsappHumanTakeoverBy: actorUserId || null,
+              whatsappHumanTakeoverUntil: takeoverUntilIso,
+              lastInteraction: 'Lead asked for human support on WhatsApp',
+            });
             await db.query(
               `INSERT INTO notifications (user_id, org_id, type, title, message, body, read, metadata, created_at)
                VALUES ($1,$2,'sales_automation',$3,$4,$4,false,$5::jsonb,NOW())`,
@@ -311,6 +368,13 @@ async function whatsappInbound(req, res) {
                 JSON.stringify({ leadId: lead.id, channel: 'whatsapp', priority: 'critical' }),
               ]
             );
+            if (whatsappService.isWhatsAppEnabled()) {
+              await whatsappService.sendWhatsAppText({
+                to: lead.contact_phone || from,
+                text: `Thanks ${honorificNameJi(leadName) || ''}. A human teammate will continue this chat shortly.`,
+              });
+            }
+            continue;
           }
 
           const takeoverUntil = new Date(String(leadMd.whatsappHumanTakeoverUntil || 0)).getTime();
@@ -357,6 +421,10 @@ async function whatsappInbound(req, res) {
               }),
             ]
           );
+          await upsertLeadMetadata(lead.id, {
+            lastInteraction: `Assist Pal reply: ${aiReply.slice(0, 180)}`,
+            lastActivityAt: new Date().toISOString(),
+          });
 
           if (shouldStayIn24hWindow(text)) {
             await db.query(

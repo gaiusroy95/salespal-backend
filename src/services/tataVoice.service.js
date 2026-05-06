@@ -78,6 +78,22 @@ function normalizeDialNumber(rawNumber, { assumeIndianFor10Digit = true } = {}) 
   return digits;
 }
 
+function buildDialVariants(rawDigits, { forDestination = false } = {}) {
+  const base = String(rawDigits || '').replace(/[^\d]/g, '');
+  if (!base) return [];
+  const out = [];
+  const push = (v) => {
+    const s = String(v || '').replace(/[^\d]/g, '');
+    if (!s) return;
+    if (!out.includes(s)) out.push(s);
+  };
+  push(base);
+  if (base.startsWith('91') && base.length === 12) push(base.slice(2)); // Smartflo configs that expect local mobile
+  if (/^\d{10}$/.test(base)) push(`91${base}`); // Smartflo configs that expect country code
+  if (forDestination && base.startsWith('0') && base.length > 10) push(base.replace(/^0+/, ''));
+  return out;
+}
+
 const OPENER_PAYLOAD_MAX_LEN = 950;
 const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
 
@@ -228,6 +244,40 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
   });
 }
 
+async function postSupportWithSmartRetries(apiUrl, payloadBase) {
+  const destinationVariants = buildDialVariants(payloadBase.destinationNumber, { forDestination: true });
+  const callerVariants = buildDialVariants(payloadBase.callerId, { forDestination: false });
+  const callerCandidates = callerVariants.length ? callerVariants : [''];
+  const attempts = [];
+  for (const destinationNumber of destinationVariants) {
+    for (const callerId of callerCandidates) {
+      attempts.push({ destinationNumber, callerId });
+    }
+    // Also attempt without caller_id once per destination for strict portal configs.
+    attempts.push({ destinationNumber, callerId: '' });
+  }
+
+  let lastResponse = null;
+  for (let i = 0; i < attempts.length; i += 1) {
+    const a = attempts[i];
+    const response = await postSupportClickToCall(apiUrl, {
+      ...payloadBase,
+      destinationNumber: a.destinationNumber,
+      callerId: a.callerId,
+    });
+    if (response.status >= 200 && response.status < 300) return response;
+    lastResponse = response;
+    if (response.status !== 422) return response;
+    logger.warn('[telephony] Support API 422; retrying with alternate dial format', {
+      attempt: i + 1,
+      destination_len: a.destinationNumber.length,
+      caller_present: Boolean(a.callerId),
+      status: response.status,
+    });
+  }
+  return lastResponse;
+}
+
 async function placeOutboundCall({
   to,
   leadName,
@@ -293,7 +343,7 @@ async function placeOutboundCall({
   try {
     let response;
     if (apiStyle === 'support') {
-      response = await postSupportClickToCall(apiUrl, payloadBase);
+      response = await postSupportWithSmartRetries(apiUrl, payloadBase);
     } else {
       const authHeader = buildAuthHeader();
       const headers = {

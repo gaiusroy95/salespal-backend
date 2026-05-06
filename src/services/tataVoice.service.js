@@ -15,6 +15,12 @@ function resolveApiStyle() {
   return 'legacy';
 }
 
+function resolveLegacyEndpointPath() {
+  const configured = String(env.telephony?.endpointPath || '/v1/click_to_call').trim();
+  if (configured.toLowerCase().includes('click_to_call_support')) return '/v1/click_to_call';
+  return configured || '/v1/click_to_call';
+}
+
 function resolveEndpointPathForStyle(style) {
   const configured = String(env.telephony?.endpointPath || '/v1/click_to_call').trim();
   if (style !== 'support') return configured || '/v1/click_to_call';
@@ -214,6 +220,7 @@ async function postLegacyClickToCall(apiUrl, headers, payloadBase) {
 async function postSupportClickToCall(apiUrl, payloadBase) {
   const destinationNumber = payloadBase.destinationNumber;
   const callerId = payloadBase.callerId;
+  const agentNumber = payloadBase.agentNumber || callerId;
   const openerTrimmed = payloadBase.openerTrimmed;
   const pn = payloadBase.pn;
   const pid = payloadBase.pid;
@@ -227,6 +234,9 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
 
   const ringMs = Number(env.telephony.ringTimeoutMs ?? 30000);
   const ringSec = Math.max(10, Math.min(30, Math.ceil(ringMs / 1000)));
+  const destinationE164 = destinationNumber ? `+${destinationNumber}` : '';
+  const callerE164 = callerId ? `+${callerId}` : '';
+  const agentE164 = agentNumber ? `+${agentNumber}` : '';
 
   const custom_identifier = buildCustomIdentifierPayload({
     conversationId: payloadBase.conversationId,
@@ -242,11 +252,24 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
     api_key: supportKey,
     // Keep multiple aliases for Smartflo account variants.
     customer_number: destinationNumber,
+    customerNumber: destinationNumber,
     destination_number: destinationNumber,
     destinationNumber,
+    phone_number: destinationNumber,
+    to: destinationNumber,
+    ...(destinationE164 ? { customer_number_e164: destinationE164 } : {}),
+    ...(destinationE164 ? { destination_number_e164: destinationE164 } : {}),
+    ...(destinationE164 ? { customer_number_plus: destinationE164 } : {}),
     async: Number(env.telephony.asyncMode ?? 1) || 1,
     ...(callerId ? { caller_id: callerId } : {}),
     ...(callerId ? { callerId } : {}),
+    ...(callerId ? { from: callerId } : {}),
+    ...(callerId ? { from_number: callerId } : {}),
+    ...(callerE164 ? { caller_id_e164: callerE164 } : {}),
+    ...(callerE164 ? { caller_id_plus: callerE164 } : {}),
+    ...(agentNumber ? { agent_number: agentNumber } : {}),
+    ...(agentNumber ? { agentNumber } : {}),
+    ...(agentE164 ? { agent_number_e164: agentE164 } : {}),
     customer_ring_timeout: ringSec,
     get_call_id: Number(env.telephony.getCallId ?? 1),
     custom_identifier,
@@ -330,9 +353,10 @@ async function placeOutboundCall({
     err.code = 'TATA_CONFIG_ERROR';
     throw err;
   }
-  const endpointPath = resolveEndpointPathForStyle(resolveApiStyle());
+  const resolvedApiStyle = resolveApiStyle();
+  const endpointPath = resolveEndpointPathForStyle(resolvedApiStyle);
   const apiUrl = joinUrl(apiBase, endpointPath);
-  const apiStyle = resolveApiStyle();
+  const apiStyle = resolvedApiStyle;
 
   const destinationNumber = normalizeDialNumber(to, { assumeIndianFor10Digit: true });
   const agentNumber = normalizeDialNumber(env.telephony.fromNumber, { assumeIndianFor10Digit: false });
@@ -369,10 +393,8 @@ async function placeOutboundCall({
   };
 
   try {
-    let response;
-    if (apiStyle === 'support') {
-      response = await postSupportWithSmartRetries(apiUrl, payloadBase);
-    } else {
+    const sendLegacy = async () => {
+      const legacyApiUrl = joinUrl(apiBase, resolveLegacyEndpointPath());
       const authHeader = buildAuthHeader();
       const headers = {
         'Content-Type': 'application/json',
@@ -380,35 +402,69 @@ async function placeOutboundCall({
         ...env.telephony.extraHeaders,
       };
       if (authHeader) headers.Authorization = authHeader;
-      response = await postLegacyClickToCall(apiUrl, headers, payloadBase);
-    }
-
-    if (response.status < 200 || response.status >= 300) {
-      const err = new Error(
-        `Tata API rejected call request with status ${response.status}.`
-      );
-      err.code = 'TATA_CALL_REJECTED';
-      err.details = response.data;
-      throw err;
-    }
-
-    const data = response.data || {};
-    const providerCallId = extractProviderCallId(data);
-    if (bodyLooksRejected(data) || (!providerCallId && bodyLooksRejected(data))) {
-      const err = new Error('Tata API returned success status but rejected call in response body.');
-      err.code = 'TATA_CALL_REJECTED';
-      err.details = data;
-      throw err;
-    }
-    return {
-      enabled: true,
-      provider: 'tata',
-      accepted: true,
-      apiStyle,
-      statusCode: response.status,
-      providerCallId,
-      raw: data,
+      const response = await postLegacyClickToCall(legacyApiUrl, headers, payloadBase);
+      if (response.status < 200 || response.status >= 300) {
+        const err = new Error(`Tata API rejected call request with status ${response.status}.`);
+        err.code = 'TATA_CALL_REJECTED';
+        err.details = response.data;
+        throw err;
+      }
+      const data = response.data || {};
+      if (bodyLooksRejected(data)) {
+        const err = new Error('Tata API returned success status but rejected call in response body.');
+        err.code = 'TATA_CALL_REJECTED';
+        err.details = data;
+        throw err;
+      }
+      return {
+        enabled: true,
+        provider: 'tata',
+        accepted: true,
+        apiStyle: 'legacy',
+        statusCode: response.status,
+        providerCallId: extractProviderCallId(data),
+        raw: data,
+      };
     };
+
+    if (apiStyle === 'support') {
+      try {
+        const supportResponse = await postSupportWithSmartRetries(apiUrl, payloadBase);
+        if (supportResponse.status >= 200 && supportResponse.status < 300) {
+          const supportData = supportResponse.data || {};
+          const providerCallId = extractProviderCallId(supportData);
+          if (!bodyLooksRejected(supportData) && providerCallId) {
+            return {
+              enabled: true,
+              provider: 'tata',
+              accepted: true,
+              apiStyle: 'support',
+              statusCode: supportResponse.status,
+              providerCallId,
+              raw: supportData,
+            };
+          }
+          logger.warn('[telephony] Support API responded but without reliable acceptance; falling back to legacy click_to_call', {
+            has_provider_call_id: Boolean(providerCallId),
+            status: supportResponse.status,
+          });
+        } else {
+          logger.warn('[telephony] Support API non-2xx; falling back to legacy click_to_call', {
+            status: supportResponse.status,
+          });
+        }
+      } catch (supportErr) {
+        logger.warn('[telephony] Support API failed; falling back to legacy click_to_call', {
+          code: supportErr?.code || '',
+          message: supportErr?.message || '',
+        });
+      }
+      const legacyAccepted = await sendLegacy();
+      legacyAccepted.fallbackFromSupport = true;
+      return legacyAccepted;
+    }
+
+    return await sendLegacy();
   } catch (error) {
     const err = new Error(error.message || 'Failed to place outbound call via Tata API.');
     err.code = error.code || 'TATA_CALL_FAILED';

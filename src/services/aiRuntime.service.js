@@ -642,6 +642,7 @@ async function buildVoiceProjectDiscussionBrief({ orgId: _fallbackOrgId, project
 function resolveVoiceTtsForClient() {
   const want = String(env.integrations?.voiceTtsProvider || 'auto').trim().toLowerCase();
   const sarvamOk = sarvamService.isSarvamTtsConfigured(env);
+  const enforceOnly = want === 'sarvam';
   /** auto (default): use Sarvam whenever API key is set; explicit browser skips Sarvam. */
   let provider = 'browser';
   if (want === 'browser') {
@@ -653,6 +654,11 @@ function resolveVoiceTtsForClient() {
     provider,
     sarvam_configured: sarvamOk,
     requested_provider: want,
+    enforce_only: enforceOnly,
+    unavailable_reason:
+      enforceOnly && !sarvamOk
+        ? 'Sarvam TTS is required but SARVAM_API_SUBSCRIPTION_KEY is missing.'
+        : null,
     mime_type_hint: provider === 'sarvam' ? 'audio/wav' : null,
   };
 }

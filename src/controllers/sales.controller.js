@@ -911,7 +911,15 @@ async function listLeadActions(req, res, next) {
     const lim = parseInt(String(req.query.limit || '200'), 10);
     const limit = Number.isFinite(lim) && lim > 0 ? Math.min(lim, 500) : 200;
     const { rows } = await db.query(
-      `SELECT * FROM lead_actions WHERE lead_id = $1 ORDER BY created_at ASC LIMIT $2`,
+      `SELECT *
+       FROM (
+         SELECT *
+         FROM lead_actions
+         WHERE lead_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2
+       ) recent
+       ORDER BY created_at ASC`,
       [leadId, limit]
     );
     res.json(rows);

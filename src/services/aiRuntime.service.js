@@ -388,6 +388,9 @@ async function buildContextualVoiceOpener({ locale, contactName, openerContext, 
         : 'No specific project was selected; keep the opener generic but helpful.',
       pb ? `Project facts and materials (ground truth for what you may reference — do not invent beyond this):\n${pb.slice(0, 3200)}` : null,
       context ? `Continue from this prior WhatsApp context when relevant:\n${context.slice(0, 1200)}` : null,
+      pb && /https?:\/\/|\bwebsite\b|\bweb[\s-]?page\b|\bportal\b/i.test(pb)
+        ? 'Materials may cite URLs or webpages — phrase them as “from the project documents we have on file”, never live browsing.'
+        : null,
       'Rules: 1-2 lines only, spoken style, no bullets, no placeholders, warm and consultative.',
     ]
       .filter(Boolean)
@@ -464,10 +467,95 @@ function normalizeAgentName(name) {
   return raw.slice(0, 40);
 }
 
+/** Pull http(s) / www URLs from spoken or typed fragments (voice transcripts vary). */
+function extractUrlsFromUtterance(text) {
+  const raw = String(text || '');
+  const out = [];
+  const re = /\b(https?:\/\/[^\s<>"')\]]+|www\.[^\s<>"')\]]+)/gi;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    let chunk = String(m[1] || '').trim();
+    chunk = chunk.replace(/[,;.]+$/g, '');
+    if (chunk) out.push(chunk);
+  }
+  return [...new Set(out)];
+}
+
+function hostnameVariantsForMatch(urlLike) {
+  const s = String(urlLike || '').trim();
+  if (!s) return [];
+  try {
+    const normalized = /^https?:/i.test(s) ? s : `https://${s}`;
+    const { hostname } = new URL(normalized);
+    const h = hostname.toLowerCase().replace(/^www\./, '');
+    const parts = new Set([hostname.toLowerCase(), h, h.replace(/^www\./, '')]);
+    return [...parts].filter(Boolean);
+  } catch (_) {
+    return [s.toLowerCase()];
+  }
+}
+
+/**
+ * Prefer rows whose source_name/content explicitly mention the user's URL/domain,
+ * then fill with semantic retrieveTopK. Deduped; capped.
+ */
+function mergeKnowledgeSemanticAndUrlRows(rows, queryText, semanticK = 8, maxTotal = 14) {
+  const list = rows || [];
+  const q = String(queryText || '').trim();
+  const urls = extractUrlsFromUtterance(q);
+  const needleSet = new Set();
+  for (const u of urls) {
+    const low = u.toLowerCase();
+    needleSet.add(low);
+    hostnameVariantsForMatch(u).forEach((h) => needleSet.add(h));
+  }
+
+  let semantic = retrieveTopK(urls.length ? `${urls.slice(0, 3).join(' ')}\n${q}` : q || 'project overview', list, semanticK);
+
+  const urlHits = [];
+  if (needleSet.size) {
+    for (const r of list) {
+      const name = String(r.source_name || '').toLowerCase();
+      const body = String(r.content || '').toLowerCase();
+      for (const n of needleSet) {
+        if (n.length < 4) continue;
+        if (name.includes(n) || body.includes(n)) {
+          urlHits.push(r);
+          break;
+        }
+      }
+    }
+  }
+
+  const seen = new Set();
+  const merged = [];
+  const pushUnique = (r) => {
+    const key = `${r.source_type}|${String(r.source_name || '').slice(0, 320)}|${String(r.content || '').slice(0, 160)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(r);
+  };
+  urlHits.forEach(pushUnique);
+  semantic.forEach(pushUnique);
+  return merged.slice(0, Math.max(maxTotal, semanticK));
+}
+
+function utteranceReferencesWebOrListingSite(text) {
+  const s = String(text || '');
+  if (/\b(https?:\/\/|www\.)/i.test(s)) return true;
+  const t = s.toLowerCase();
+  return /(\bwebsite\b|\bweb[\s-]?site\b|\blanding\b|\bsite\b.*\b(off|official|portal)\b|\bportal\b|\burl\b|\bonline\b|\bpage\b|\bवेबसाइट\b|\bసైట్\b|\bसाइट\b)/i.test(
+    t
+  );
+}
+
+/** True when the reply should emphasize project materials over generic trivia. */
 function isProjectFactQuestion(text) {
-  const t = String(text || '').toLowerCase();
-  if (!t) return false;
-  return /(project|property|plot|site|location|address|price|pricing|rate|cost|acre|sq ?ft|inventory|availability|amenities|rera|legal|possession|payment plan|booking)/i.test(
+  const raw = String(text || '');
+  if (!raw.trim()) return false;
+  if (/\b(https?:\/\/|www\.)/i.test(raw)) return true;
+  const t = raw.toLowerCase();
+  return /(\bwebsite\b|\bweb[\s-]?site\b|\bportal\b|\blanding\b|\burl\b|\bpage\b|\bonline\b|\bवेबसाइट\b|project|property|plot|\blisting\b|inventory|tower|phase|developers?|builders?|community|township|\bflat\b|\bflats\b|\bvilla\b|\bapartment\b|\bbhk\b|brochure|pamphlet|\bfaq\b|rera|\bsite\s+visit\b|\bwalkthrough\b|\bvirtual\s+tour\b|location|address|nearest|metro|maps?|connectivity|pricing|price|rate|cost|emi|booking|possession|amenities|legal|payment\s+plan|acre|sq\.?\s*ft|square\s+feet|yard|hectares?|availability|rera\s+number)/i.test(
     t
   );
 }
@@ -487,8 +575,7 @@ async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, user
     [kbOrgId, projectId]
   );
   if (!rows.length) return [];
-  const q = String(queryText || '').trim() || 'project overview';
-  return retrieveTopK(q, rows, 8);
+  return mergeKnowledgeSemanticAndUrlRows(rows, queryText, 8, 14);
 }
 
 async function fetchProjectRecordForVoice({ orgId, projectId }) {
@@ -951,7 +1038,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   const asksProjectFacts = isProjectFactQuestion(text);
 
   const pivotWhenProject = projectId
-    ? '\n- **Project-first call:** This session has a selected listing. Keep the dialogue centered on it: fit for the lead, clarifying questions, site visit, brochure, next step. For off-topic or purely general questions, answer very briefly in spoken style, then steer back to the project in the same reply.\n- Do not invent project facts; use KNOWLEDGE BOUNDARY + baseline below.'
+    ? '\n- **Project-first call:** This session has a selected listing. Anchor on it for brochure, "**the website**", portal/pricing links, towers/phases, RERA visits, timelines, paperwork.\n- If the lead mentions a URL or "**official site**", treat it as a question about this listing and answer from KNOWLEDGE BOUNDARY + baseline only unless they clearly switched topic.\n- Off-topic chatter: acknowledge briefly (spoken style), then steer back.\n- Do not invent listing facts beyond KNOWLEDGE BOUNDARY + baseline.'
     : '';
 
   const boundaryWhenHasRows = topKnowledge.length
@@ -986,9 +1073,15 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
     ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nPRIMARY SUBJECT (NON-NEGOTIABLE)\n- This Tata / SalesPal voice session exists ONLY to sell and qualify interest in: **"${listingLabel}"**.\n- You MUST name this listing explicitly when it helps clarity and keep substance tied to location fit, pricing band, timelines, inventory, amenities, paperwork, visit — for THIS listing only.\n- Do **not** treat this as a generic customer-service call.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`
     : '';
 
+  const mentionsUrlOrWebsite = utteranceReferencesWebOrListingSite(text);
+  const websiteDiscussBlock =
+    projectId && mentionsUrlOrWebsite
+      ? `\nWEBSITE / LINK QUESTION:\n- You cannot browse the live web on this call.\n- Treat portal/URL/“website” questions as about **"${listingLabel}"** only: use PROJECT KNOWLEDGE BOUNDARY + SELECTED PROJECT CONTEXT.\n- If those excerpts mention the same hostname or URL, summarise that content in speech; if not, say clearly that this page is not in SalesPal’s indexed materials yet and offer brochure, site visit, or human follow-up.\n- Do not answer with unrelated generic web knowledge when the lead asked about this listing’s site.\n`
+      : '';
+
   const voiceSystem = `You are on a live phone-style sales call with a lead (SalesPal).
 
-${projectMandatoryBlock}${crmBlock}${personaSupervisorBlock}
+${projectMandatoryBlock}${websiteDiscussBlock}${crmBlock}${personaSupervisorBlock}
 INTENT & CLASSIFICATION:
 - CRM currently labels this lead as **${crmIntentTier}** (Hot / Warm / Cold). Use the live conversation to validate or adjust mentally.
 - When the conversation is winding down or the lead says goodbye, include **one clear spoken sentence** that states your assessment, e.g. "Based on our chat I would mark you as a warm lead today because …" (use Hot/Warm/Cold and a real reason — no jargon about "CRM").

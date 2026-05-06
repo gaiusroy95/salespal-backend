@@ -64,6 +64,20 @@ function joinUrl(base, path) {
   return `${b}/${p.replace(/^\/+/, '')}`;
 }
 
+function normalizeDialNumber(rawNumber, { assumeIndianFor10Digit = true } = {}) {
+  const raw = String(rawNumber || '').trim();
+  if (!raw) return '';
+  let digits = raw.replace(/[^\d]/g, '');
+  if (!digits) return '';
+  // Accept "00" international prefix and convert to plain country-code digits.
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  // Common India CRM input: local 10-digit mobile without country code.
+  if (assumeIndianFor10Digit && /^\d{10}$/.test(digits)) {
+    digits = `91${digits}`;
+  }
+  return digits;
+}
+
 const OPENER_PAYLOAD_MAX_LEN = 950;
 const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
 
@@ -242,26 +256,26 @@ async function placeOutboundCall({
   const apiUrl = joinUrl(apiBase, endpointPath);
   const apiStyle = resolveApiStyle();
 
-  const destinationNumber = String(to || '').replace(/[^\d]/g, '');
-  const agentNumber = String(env.telephony.fromNumber || '').replace(/[^\d]/g, '');
-  const callerId = String(env.telephony.fromNumber || '').replace(/[^\d]/g, '');
+  const destinationNumber = normalizeDialNumber(to, { assumeIndianFor10Digit: true });
+  const agentNumber = normalizeDialNumber(env.telephony.fromNumber, { assumeIndianFor10Digit: false });
+  const callerId = normalizeDialNumber(env.telephony.fromNumber, { assumeIndianFor10Digit: false });
   const openerTrimmed = String(opener || '').trim().slice(0, OPENER_PAYLOAD_MAX_LEN);
   const pn = projectName ? String(projectName).trim().slice(0, 240) : '';
   const pid = projectId ? String(projectId).trim().slice(0, 120) : '';
 
-  if (apiStyle === 'legacy' && pn) {
+  if (!destinationNumber || destinationNumber.length < 8 || destinationNumber.length > 15) {
     const err = new Error(
-      'Project-specific PSTN dialogue requires Smartflo Click to Call Support API + Voice Bot destination. Legacy /v1/click_to_call cannot guarantee project speech.'
+      'Invalid destination phone for Tata call. Use full mobile with country code (e.g. 91XXXXXXXXXX).'
     );
-    err.code = 'TATA_PROJECT_SPEECH_UNSUPPORTED_IN_LEGACY';
-    err.details = {
-      required_endpoint: '/v1/click_to_call_support',
-      required_style: 'support',
-      current_endpoint: String(env.telephony?.endpointPath || '/v1/click_to_call'),
-      current_style: String(env.telephony?.apiStyle || 'auto'),
-      project_name: pn,
-    };
+    err.code = 'TATA_INVALID_DESTINATION_PHONE';
+    err.details = { provided: String(to || '') };
     throw err;
+  }
+
+  if (apiStyle === 'legacy' && pn) {
+    logger.warn(
+      '[telephony] Legacy click_to_call active with project context: call will continue, but listing-specific speech is not guaranteed on handset.'
+    );
   }
 
   const payloadBase = {

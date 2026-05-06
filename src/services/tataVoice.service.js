@@ -94,6 +94,29 @@ function buildDialVariants(rawDigits, { forDestination = false } = {}) {
   return out;
 }
 
+function extractProviderCallId(data) {
+  if (!data || typeof data !== 'object') return null;
+  return (
+    data.callId ||
+    data.call_id ||
+    data.uuid ||
+    data.call_to_number ||
+    data.requestId ||
+    data.request_id ||
+    data.id ||
+    null
+  );
+}
+
+function bodyLooksRejected(data) {
+  if (!data || typeof data !== 'object') return false;
+  const status = String(data.status ?? data.result ?? data.success ?? '').toLowerCase();
+  const msg = String(data.message ?? data.error ?? data.reason ?? '').toLowerCase();
+  if (status === 'false' || status === 'failed' || status === 'error' || status === 'rejected') return true;
+  if (msg.includes('invalid') || msg.includes('reject') || msg.includes('failed') || msg.includes('error')) return true;
+  return false;
+}
+
 const OPENER_PAYLOAD_MAX_LEN = 950;
 const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
 
@@ -217,10 +240,15 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
   const payload = {
     ...env.telephony.staticPayload,
     api_key: supportKey,
+    // Keep multiple aliases for Smartflo account variants.
     customer_number: destinationNumber,
+    destination_number: destinationNumber,
+    destinationNumber,
     async: Number(env.telephony.asyncMode ?? 1) || 1,
     ...(callerId ? { caller_id: callerId } : {}),
+    ...(callerId ? { callerId } : {}),
     customer_ring_timeout: ringSec,
+    get_call_id: Number(env.telephony.getCallId ?? 1),
     custom_identifier,
   };
 
@@ -365,21 +393,20 @@ async function placeOutboundCall({
     }
 
     const data = response.data || {};
+    const providerCallId = extractProviderCallId(data);
+    if (bodyLooksRejected(data) || (!providerCallId && bodyLooksRejected(data))) {
+      const err = new Error('Tata API returned success status but rejected call in response body.');
+      err.code = 'TATA_CALL_REJECTED';
+      err.details = data;
+      throw err;
+    }
     return {
       enabled: true,
       provider: 'tata',
       accepted: true,
       apiStyle,
       statusCode: response.status,
-      providerCallId:
-        data.callId ||
-        data.call_id ||
-        data.uuid ||
-        data.call_to_number ||
-        data.requestId ||
-        data.request_id ||
-        data.id ||
-        null,
+      providerCallId,
       raw: data,
     };
   } catch (error) {

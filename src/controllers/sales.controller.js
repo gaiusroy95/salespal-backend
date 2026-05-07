@@ -591,25 +591,74 @@ async function getOwnerReportSettings(userId) {
   };
 }
 
-async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, queryText }) {
+function normalizeNameForMatch(v) {
+  return String(v || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function resolveProjectForLead({ orgId, leadId, leadMetadata }) {
   const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
   let projectId = String(md.projectId || md.project_id || '').trim();
-  if (!projectId && leadId) {
-    const { rows: leadRows } = await db.query(`SELECT metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [
-      leadId,
-      orgId,
-    ]);
-    const fromLead = leadRows[0]?.metadata && typeof leadRows[0].metadata === 'object' ? leadRows[0].metadata : {};
-    projectId = String(fromLead.projectId || fromLead.project_id || '').trim();
-  }
-  if (!projectId) return '';
+  let project = null;
+  let leadCompanyName = '';
 
-  const { rows: projectRows } = await db.query(
-    `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
-    [projectId, orgId]
-  );
-  const project = projectRows[0];
-  if (!project) return '';
+  if (leadId) {
+    const { rows: leadRows } = await db.query(
+      `SELECT company_name, metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [leadId, orgId]
+    );
+    const lead = leadRows[0];
+    leadCompanyName = String(lead?.company_name || '').trim();
+    const fromLead = lead?.metadata && typeof lead.metadata === 'object' ? lead.metadata : {};
+    if (!projectId) projectId = String(fromLead.projectId || fromLead.project_id || '').trim();
+    if (!md.projectName && fromLead.projectName) md.projectName = fromLead.projectName;
+    if (!md.project_name && fromLead.project_name) md.project_name = fromLead.project_name;
+  }
+
+  if (projectId) {
+    const { rows } = await db.query(
+      `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [projectId, orgId]
+    );
+    project = rows[0] || null;
+  }
+
+  const hintedNames = [md.projectName, md.project_name, leadCompanyName]
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+
+  if (!project && hintedNames.length) {
+    const { rows } = await db.query(`SELECT id, name, description FROM projects WHERE org_id = $1 LIMIT 300`, [orgId]);
+    const candidates = rows || [];
+    for (const hint of hintedNames) {
+      const normalizedHint = normalizeNameForMatch(hint);
+      if (!normalizedHint) continue;
+      const exact = candidates.find((p) => normalizeNameForMatch(p.name) === normalizedHint);
+      if (exact) {
+        project = exact;
+        break;
+      }
+      const includes = candidates.find(
+        (p) =>
+          normalizeNameForMatch(p.name).includes(normalizedHint) ||
+          normalizedHint.includes(normalizeNameForMatch(p.name))
+      );
+      if (includes) {
+        project = includes;
+        break;
+      }
+    }
+  }
+
+  return project || null;
+}
+
+async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, queryText }) {
+  const project = await resolveProjectForLead({ orgId, leadId, leadMetadata });
+  const projectId = String(project?.id || '').trim();
+  if (!projectId) return '';
 
   const { rows: knowledgeRows } = await db.query(
     `SELECT source_type, source_name, content, embedding
@@ -637,6 +686,7 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, qu
     '- If asked anything outside this project, answer briefly then steer back to this project.',
     '- Never switch to generic SalesPal product marketing unless the lead explicitly asks about SalesPal software itself.',
     '- If specific project detail is not in evidence, clearly say it is not in indexed project materials and offer human follow-up.',
+    '- If user says "about project X", prioritize that mapped project and avoid generic SalesPal pitch.',
   ]
     .filter(Boolean)
     .join('\n');

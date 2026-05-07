@@ -72,7 +72,7 @@ async function findLeadByPhone(phoneDigits) {
   if (!phoneDigits) return null;
   const last10 = phoneDigits.slice(-10);
   const { rows } = await db.query(
-    `SELECT id, org_id, user_id, assigned_to, contact_first_name, contact_last_name, contact_phone, metadata
+    `SELECT id, org_id, user_id, assigned_to, contact_first_name, contact_last_name, contact_phone, company_name, metadata
      FROM leads
      WHERE regexp_replace(COALESCE(contact_phone, ''), '\D', '', 'g') = $1
         OR RIGHT(regexp_replace(COALESCE(contact_phone, ''), '\D', '', 'g'), 10) = $2
@@ -132,17 +132,69 @@ function buildSimpleAutomationFingerprint(seed) {
   return crypto.createHash('sha256').update(String(seed || '')).digest('hex');
 }
 
-async function buildLeadProjectKnowledgePrompt({ orgId, leadMetadata, queryText }) {
+function normalizeNameForMatch(v) {
+  return String(v || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function resolveProjectForLead({ orgId, leadMetadata, leadCompanyName }) {
   const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
-  const projectId = String(md.projectId || md.project_id || '').trim();
+  let projectId = String(md.projectId || md.project_id || '').trim();
+  let project = null;
+
+  if (projectId) {
+    const { rows } = await db.query(
+      `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [projectId, orgId]
+    );
+    project = rows[0] || null;
+  }
+
+  const hintedNames = [
+    md.projectName,
+    md.project_name,
+    md.selectedProjectName,
+    md.selected_project_name,
+    leadCompanyName,
+  ]
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+
+  if (!project && hintedNames.length) {
+    const { rows } = await db.query(`SELECT id, name, description FROM projects WHERE org_id = $1 LIMIT 300`, [orgId]);
+    const candidates = rows || [];
+    for (const hint of hintedNames) {
+      const normalizedHint = normalizeNameForMatch(hint);
+      if (!normalizedHint) continue;
+      const exact = candidates.find((p) => normalizeNameForMatch(p.name) === normalizedHint);
+      if (exact) {
+        project = exact;
+        break;
+      }
+      const includes = candidates.find(
+        (p) =>
+          normalizeNameForMatch(p.name).includes(normalizedHint) ||
+          normalizedHint.includes(normalizeNameForMatch(p.name))
+      );
+      if (includes) {
+        project = includes;
+        break;
+      }
+    }
+  }
+
+  return project || null;
+}
+
+async function buildLeadProjectKnowledgePrompt({ orgId, leadMetadata, leadCompanyName, queryText }) {
+  const project = await resolveProjectForLead({ orgId, leadMetadata, leadCompanyName });
+  if (!project) return '';
+  const projectId = String(project.id || '').trim();
   if (!projectId) return '';
 
-  const { rows: projectRows } = await db.query(
-    `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
-    [projectId, orgId]
-  );
-  const project = projectRows[0];
-  if (!project) return '';
+  const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
 
   const { rows: knowledgeRows } = await db.query(
     `SELECT source_type, source_name, content, embedding
@@ -168,6 +220,8 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadMetadata, queryText 
       : '- Brain Drive evidence excerpts: none indexed yet.',
     '- Discuss this selected project only. Avoid generic SalesPal marketing replies unless explicitly asked about the software.',
     '- If requested detail is missing in evidence, say it is not in indexed materials and offer human follow-up.',
+    '- If lead asks "why SalesPal?" while this project exists, correct immediately and continue with this project context.',
+    Object.keys(md).length ? `- Lead metadata hints are available; use them only when consistent with selected project.` : null,
   ]
     .filter(Boolean)
     .join('\n');
@@ -468,6 +522,7 @@ async function whatsappInbound(req, res) {
           const projectPrompt = await buildLeadProjectKnowledgePrompt({
             orgId: lead.org_id,
             leadMetadata: leadMd,
+            leadCompanyName: lead.company_name || '',
             queryText: text,
           });
           const systemPrompt = `${aiService.systemPromptForChat('whatsapp', {

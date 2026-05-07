@@ -5,6 +5,7 @@ const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
+const { retrieveTopK } = require('../services/projectKnowledge.service');
 
 async function getOrgId(userId) {
   const { rows } = await db.query(
@@ -420,6 +421,18 @@ async function getUserSalesCallWindow(userId) {
   return { start, end };
 }
 
+async function getUserHumanPersona(userId) {
+  const { rows } = await db.query(
+    `SELECT metadata->'settings'->'sales' AS sales
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const sales = rows[0]?.sales && typeof rows[0].sales === 'object' ? rows[0].sales : {};
+  return aiService.normalizeHumanPersonaPreset(sales.aiPersona || 'friendly_consultant');
+}
+
 const DEFAULT_CALL_WINDOW_START_HOUR = 9;
 const DEFAULT_CALL_WINDOW_END_HOUR = 21; // exclusive
 const OUTBOUND_DND_START_HOUR = 21;
@@ -578,10 +591,65 @@ async function getOwnerReportSettings(userId) {
   };
 }
 
+async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, queryText }) {
+  const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
+  let projectId = String(md.projectId || md.project_id || '').trim();
+  if (!projectId && leadId) {
+    const { rows: leadRows } = await db.query(`SELECT metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [
+      leadId,
+      orgId,
+    ]);
+    const fromLead = leadRows[0]?.metadata && typeof leadRows[0].metadata === 'object' ? leadRows[0].metadata : {};
+    projectId = String(fromLead.projectId || fromLead.project_id || '').trim();
+  }
+  if (!projectId) return '';
+
+  const { rows: projectRows } = await db.query(
+    `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
+    [projectId, orgId]
+  );
+  const project = projectRows[0];
+  if (!project) return '';
+
+  const { rows: knowledgeRows } = await db.query(
+    `SELECT source_type, source_name, content, embedding
+     FROM project_knowledge
+     WHERE org_id = $1 AND project_id = $2`,
+    [orgId, projectId]
+  );
+  const q = String(queryText || '').trim() || `${project.name || 'project'} overview pricing location`;
+  const top = retrieveTopK(q, knowledgeRows, 8);
+  const contextLines = top
+    .map((r) => `[${String(r.source_type || 'source')}] ${String(r.content || '').trim()}`)
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const pn = String(project.name || '').trim();
+  const pd = String(project.description || '').trim().slice(0, 900);
+  return [
+    'PROJECT KNOWLEDGE MODE (STRICT):',
+    pn ? `- Selected project: "${pn}"` : '- Selected project exists.',
+    pd ? `- Project description:\n${pd}` : null,
+    contextLines.length
+      ? `- Brain Drive evidence excerpts (ground truth):\n${contextLines.join('\n---\n')}`
+      : '- Brain Drive evidence excerpts: none indexed yet.',
+    '- Reply about this project only (inventory, location, pricing, visit, process).',
+    '- If asked anything outside this project, answer briefly then steer back to this project.',
+    '- Never switch to generic SalesPal product marketing unless the lead explicitly asks about SalesPal software itself.',
+    '- If specific project detail is not in evidence, clearly say it is not in indexed project materials and offer human follow-up.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function parseNaturalScheduleAt(text, timeZone = 'Asia/Kolkata') {
   const t = String(text || '').toLowerCase();
   if (!t) return null;
   const now = new Date();
+
+  if (/\b(now|right now|immediately|immediate|asap|as soon as possible)\b/i.test(t)) {
+    return new Date(now.getTime() + 20 * 1000).toISOString();
+  }
 
   const inHours = t.match(/\b(?:in|after)\s+(\d{1,2})\s*(hour|hours|hr|hrs)\b/i);
   if (inHours) {
@@ -1126,6 +1194,30 @@ async function dispatchDueAutomationJobs(req, res, next) {
               }),
             ]
           );
+          if (telephony?.enabled && telephony?.accepted) {
+            const callPlacedMsg = telephony?.providerCallId
+              ? `Tata accepted the bot call (Call ID: ${telephony.providerCallId}).`
+              : 'Tata accepted the bot call request.';
+            await db.query(
+              `INSERT INTO notifications (user_id, org_id, type, title, message, body, read, metadata, created_at)
+               VALUES ($1,$2,'sales_automation',$3,$4,$4,false,$5::jsonb,NOW())`,
+              [
+                req.user.id,
+                orgId,
+                'Tata call placed successfully',
+                `${callPlacedMsg} Lead: ${leadName}`,
+                JSON.stringify({
+                  link: `/sales/leads/${job.lead_id}`,
+                  priority: 'critical',
+                  delivery_status: 'delivered',
+                  automationJobId: job.id,
+                  targetChannel: 'call',
+                  provider: telephony?.provider || 'tata',
+                  providerCallId: telephony?.providerCallId || null,
+                }),
+              ]
+            );
+          }
 
           const { rows: updatedCallJob } = await db.query(
             `UPDATE sales_automation_jobs
@@ -1207,6 +1299,13 @@ async function dispatchDueAutomationJobs(req, res, next) {
         if (!outboundText) {
           try {
             const leadLocale = leadMetadata.preferredLocale || 'hing';
+            const humanPersona = await getUserHumanPersona(req.user.id).catch(() => 'friendly_consultant');
+            const projectPrompt = await buildLeadProjectKnowledgePrompt({
+              orgId,
+              leadId: job.lead_id,
+              leadMetadata,
+              queryText: `WhatsApp follow-up for ${leadName}: ${String(payloadObj.contextHint || '')}`,
+            });
             outboundText = await aiService.callAIWithMessages(
               [
                 {
@@ -1214,7 +1313,10 @@ async function dispatchDueAutomationJobs(req, res, next) {
                   content: `Write one concise WhatsApp follow-up message for ${leadName}. Keep it natural and ask one clear next-step question.`,
                 },
               ],
-              aiService.systemPromptForChat('whatsapp', { leadPreferredLocale: leadLocale }),
+              `${aiService.systemPromptForChat('whatsapp', {
+                leadPreferredLocale: leadLocale,
+                humanPersona,
+              })}\n\n${projectPrompt}`,
               { temperature: 0.6 }
             );
           } catch (_) {

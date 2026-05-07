@@ -27,12 +27,52 @@ CONVERSATION STATE (when you are in an active sales chat with a lead):
 - Score mindset: Very positive (8–10) → thank and soft referral ask when appropriate. Mid (5–7) → soft referral or feedback. Low (1–4) → try to resolve first; if still stuck, flag that the owner should follow up.
 `;
 
+/** Shared style rules so voice + WhatsApp sound like one human agent. */
+const HUMAN_STYLE_CONSISTENCY_BLOCK = `
+HUMAN STYLE & CROSS-CHANNEL CONSISTENCY (APPLIES TO ALL REPLIES):
+- Sound like one real sales consultant, not a bot. Use natural short sentences and occasional conversational fillers when appropriate.
+- Keep the same factual meaning across channels (voice/WhatsApp): do not contradict promised time, project facts, or next steps.
+- If you commit to an action (call now, callback time, brochure, visit), state it clearly and concretely in one line.
+- Prefer specific, project-grounded wording over generic corporate language.
+- Avoid repetitive opening lines and avoid over-formal templates.
+`;
+
+const HUMAN_PERSONA_PRESETS = {
+  friendly_consultant: `
+PERSONA MODE: Friendly Consultant
+- Warm, approachable, patient, and easy to understand.
+- Prioritize trust-building and clarity over pressure.
+`,
+  premium_advisor: `
+PERSONA MODE: Premium Advisor
+- Calm, polished, and executive tone.
+- Speak with confidence and structure, without sounding stiff.
+`,
+  concise_expert: `
+PERSONA MODE: Concise Expert
+- Compact, high-signal responses.
+- Focus on the most decision-critical facts and one clear next step.
+`,
+};
+
+function normalizeHumanPersonaPreset(raw) {
+  const key = String(raw || '').trim().toLowerCase().replace(/\s+/g, '_');
+  if (HUMAN_PERSONA_PRESETS[key]) return key;
+  return 'friendly_consultant';
+}
+
+function humanStyleConsistencyBlock(preset) {
+  const key = normalizeHumanPersonaPreset(preset);
+  return `${HUMAN_STYLE_CONSISTENCY_BLOCK}\n${HUMAN_PERSONA_PRESETS[key]}`;
+}
+
 /**
  * WhatsApp drafts — human tone + match the lead's message language.
- * @param {{ leadPreferredLocale?: string, leadTimezone?: string }} [options]
+ * @param {{ leadPreferredLocale?: string, leadTimezone?: string, humanPersona?: string }} [options]
  */
 function buildWhatsAppSystemPrompt(options = {}) {
   const pref = String(options.leadPreferredLocale || 'hing').toLowerCase();
+  const persona = normalizeHumanPersonaPreset(options.humanPersona);
   const tzNote = options.leadTimezone
     ? `\nLead timezone (use only when discussing times/dates): ${options.leadTimezone}`
     : '';
@@ -51,6 +91,8 @@ TONE: Sound human in **that same language** — warm, conversational, like a rea
 RULES: Never use placeholders like [Your Name], [Name], or "Best regards, [Your Name]". Do not invent a fake personal name. If a sign-off is needed, use "— SalesPal Team" or omit it. Use the lead's first name when the prompt gives it.
 
 THREAD: Stay consistent with facts; answer mainly what they asked in their latest message unless they want a recap.
+
+${humanStyleConsistencyBlock(persona)}
 
 ${SALES_CONVERSATION_FUNNEL_BLOCK}`;
 }
@@ -445,6 +487,9 @@ async function generateJsonWithPdf(systemPrompt, userTextPrompt, pdfBuffer, opti
 module.exports = {
   SYSTEM_PROMPT,
   SALES_CONVERSATION_FUNNEL_BLOCK,
+  HUMAN_STYLE_CONSISTENCY_BLOCK,
+  normalizeHumanPersonaPreset,
+  humanStyleConsistencyBlock,
   buildWhatsAppSystemPrompt,
   systemPromptForChat,
   buildCampaignAnalysisPrompt,

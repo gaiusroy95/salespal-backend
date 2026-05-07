@@ -467,6 +467,19 @@ function normalizeAgentName(name) {
   return raw.slice(0, 40);
 }
 
+async function getUserHumanPersona(userId) {
+  if (!userId) return 'friendly_consultant';
+  const { rows } = await db.query(
+    `SELECT metadata->'settings'->'sales' AS sales
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const sales = rows[0]?.sales && typeof rows[0].sales === 'object' ? rows[0].sales : {};
+  return aiService.normalizeHumanPersonaPreset(sales.aiPersona || 'friendly_consultant');
+}
+
 /** Pull http(s) / www URLs from spoken or typed fragments (voice transcripts vary). */
 function extractUrlsFromUtterance(text) {
   const raw = String(text || '');
@@ -784,6 +797,7 @@ async function createVoiceSession({
   const conversationId = newExternalId('vs');
   const contactName = name || 'User';
   const safeAgentName = normalizeAgentName(agentName);
+  const voiceStylePersona = await getUserHumanPersona(userId).catch(() => 'friendly_consultant');
   let voiceProjectBrief = '';
   let voiceProjectName = null;
   let voiceProjectHasKnowledge = false;
@@ -805,6 +819,7 @@ async function createVoiceSession({
   const metadata = {
     projectId: projectId || null,
     agentName: safeAgentName,
+    voiceStylePersona,
     voiceProjectBrief,
     voiceProjectName,
     voiceProjectHasKnowledge,
@@ -973,6 +988,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
   let voiceProjectBrief = String(md.voiceProjectBrief || '').trim();
   let voiceProjectName = String(md.voiceProjectName || '').trim();
   const agentName = normalizeAgentName(md.agentName || 'SalesPal AI');
+  const voiceStylePersona = aiService.normalizeHumanPersonaPreset(md.voiceStylePersona || 'friendly_consultant');
 
   const effectiveOrgForProject = row.org_id || orgId;
   const hydrateFailed = Boolean(md.voiceProjectHydrateFailed);
@@ -1112,6 +1128,7 @@ Rules:
 - Never use placeholders like [Your Name]. Address the lead as above (honorific Ji when using full polite name).
 
 ${aiService.SALES_CONVERSATION_FUNNEL_BLOCK}
+${aiService.humanStyleConsistencyBlock(voiceStylePersona)}
 ${projectDiscussionSticky}
 ${projectBoundary}`;
 

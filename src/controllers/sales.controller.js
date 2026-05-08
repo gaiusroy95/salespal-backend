@@ -534,6 +534,17 @@ function nextRetryAtIso(baseIso, attemptNumber, leadTimezone) {
   return nextAvailableOutboundIso(nextIso, leadTimezone);
 }
 
+function normalizeSinceIso(value) {
+  if (!value) return new Date(0).toISOString();
+  if (value instanceof Date) {
+    const ts = value.getTime();
+    return Number.isFinite(ts) ? new Date(ts).toISOString() : new Date(0).toISOString();
+  }
+  const ts = new Date(String(value)).getTime();
+  if (!Number.isFinite(ts)) return new Date(0).toISOString();
+  return new Date(ts).toISOString();
+}
+
 async function hasInboundReplySince({ leadId, sinceIso }) {
   const { rows } = await db.query(
     `SELECT 1
@@ -1141,10 +1152,11 @@ async function dispatchDueAutomationJobs(req, res, next) {
       const payloadObj = job.payload && typeof job.payload === 'object' ? job.payload : {};
 
       if (payloadObj.kind === 'lost_eval') {
-        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso: String(payloadObj.sinceAt || job.created_at) });
+        const sinceIso = normalizeSinceIso(payloadObj.sinceAt || job.created_at);
+        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso });
         const delivery = await summarizeOutboundDeliverySince({
           leadId: job.lead_id,
-          sinceIso: String(payloadObj.sinceAt || job.created_at),
+          sinceIso,
         });
         const pendingDeliveryOnly =
           Number(delivery.total || 0) > 0 &&
@@ -1316,7 +1328,7 @@ async function dispatchDueAutomationJobs(req, res, next) {
           );
           continue;
         }
-        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso: String(job.created_at) });
+        const hasReply = await hasInboundReplySince({ leadId: job.lead_id, sinceIso: normalizeSinceIso(job.created_at) });
         if (hasReply) {
           await db.query(
             `UPDATE sales_automation_jobs

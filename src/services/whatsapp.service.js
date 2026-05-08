@@ -11,6 +11,26 @@ function normalizeWhatsAppPhone(phone) {
   return raw.replace(/[^\d]/g, '');
 }
 
+function buildWhatsAppProviderError(err, fallbackCode = 'WHATSAPP_PROVIDER_ERROR') {
+  const response = err?.response;
+  const payload = response?.data && typeof response.data === 'object' ? response.data : {};
+  const providerErr = payload?.error && typeof payload.error === 'object' ? payload.error : {};
+  const message =
+    String(providerErr?.error_user_msg || '').trim() ||
+    String(providerErr?.message || '').trim() ||
+    String(err?.message || 'WhatsApp provider request failed').trim();
+
+  const out = new Error(message);
+  out.code = fallbackCode;
+  out.statusCode = Number(response?.status || 0) || null;
+  out.providerCode = providerErr?.code ?? null;
+  out.providerSubcode = providerErr?.error_subcode ?? null;
+  out.providerType = providerErr?.type || null;
+  out.providerTraceId = providerErr?.fbtrace_id || null;
+  out.providerPayload = payload;
+  return out;
+}
+
 async function sendWhatsAppText({ to, text }) {
   if (!isWhatsAppEnabled()) {
     const err = new Error('WhatsApp API is not configured');
@@ -40,13 +60,19 @@ async function sendWhatsAppText({ to, text }) {
     },
   };
 
-  const response = await axios.post(env.whatsapp.apiUrl, payload, {
-    timeout: env.whatsapp.timeoutMs || 10000,
-    headers: {
-      Authorization: `Bearer ${env.whatsapp.accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
+  let response;
+  try {
+    response = await axios.post(env.whatsapp.apiUrl, payload, {
+      timeout: env.whatsapp.timeoutMs || 10000,
+      headers: {
+        Authorization: `Bearer ${env.whatsapp.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    console.log('response', response.data);
+  } catch (err) {
+    throw buildWhatsAppProviderError(err, 'WHATSAPP_SEND_TEXT_FAILED');
+  }
 
   const raw = response?.data || {};
   const messageId =
@@ -124,13 +150,18 @@ async function sendWhatsAppTemplate({ to, templateName, languageCode = 'en', bod
     },
   };
 
-  const response = await axios.post(env.whatsapp.apiUrl, payload, {
-    timeout: env.whatsapp.timeoutMs || 10000,
-    headers: {
-      Authorization: `Bearer ${env.whatsapp.accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
+  let response;
+  try {
+    response = await axios.post(env.whatsapp.apiUrl, payload, {
+      timeout: env.whatsapp.timeoutMs || 10000,
+      headers: {
+        Authorization: `Bearer ${env.whatsapp.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (err) {
+    throw buildWhatsAppProviderError(err, 'WHATSAPP_SEND_TEMPLATE_FAILED');
+  }
 
   const raw = response?.data || {};
   const messageId =

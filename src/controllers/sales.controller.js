@@ -545,6 +545,13 @@ function normalizeSinceIso(value) {
   return new Date(ts).toISOString();
 }
 
+function whatsappFailureSummary(prefix, err) {
+  const code = String(err?.providerCode || err?.code || '').trim();
+  const msg = String(err?.message || 'Unknown error').trim();
+  const codePart = code ? ` (${code})` : '';
+  return `${prefix}${codePart}: ${msg}`.slice(0, 800);
+}
+
 async function hasInboundReplySince({ leadId, sinceIso }) {
   const { rows } = await db.query(
     `SELECT 1
@@ -888,17 +895,31 @@ async function createLeadAction(req, res, next) {
           );
           row = updatedRows[0] || row;
         } catch (sendErr) {
+          console.error('[whatsapp] direct send failed', {
+            leadId,
+            userId: req.user.id,
+            code: sendErr?.code || null,
+            providerCode: sendErr?.providerCode || null,
+            statusCode: sendErr?.statusCode || null,
+            message: sendErr?.message || '',
+            traceId: sendErr?.providerTraceId || null,
+          });
           await db.query(
             `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
              VALUES ($1,$2,'ai_action',$3,'whatsapp_send_failed',$4::jsonb)`,
             [
               leadId,
               req.user.id,
-              'WhatsApp send failed. Verify WhatsApp Cloud API credentials and destination number format.',
+              whatsappFailureSummary('WhatsApp send failed', sendErr),
               JSON.stringify({
                 title: 'WhatsApp Send Failed',
                 error: sendErr?.message || 'Unknown error',
                 errorCode: sendErr?.code || null,
+                providerCode: sendErr?.providerCode || null,
+                providerSubcode: sendErr?.providerSubcode || null,
+                providerType: sendErr?.providerType || null,
+                providerTraceId: sendErr?.providerTraceId || null,
+                statusCode: sendErr?.statusCode || null,
               }),
             ]
           );
@@ -1483,18 +1504,33 @@ async function dispatchDueAutomationJobs(req, res, next) {
             }
             continue;
           } catch (waErr) {
+            console.error('[whatsapp] automation send failed', {
+              leadId: job.lead_id,
+              userId: req.user.id,
+              jobId: job.id,
+              code: waErr?.code || null,
+              providerCode: waErr?.providerCode || null,
+              statusCode: waErr?.statusCode || null,
+              message: waErr?.message || '',
+              traceId: waErr?.providerTraceId || null,
+            });
             await db.query(
               `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
                VALUES ($1,$2,'ai_action',$3,'automation_whatsapp_failed',$4::jsonb)`,
               [
                 job.lead_id,
                 req.user.id,
-                'Automated WhatsApp message failed to send. Please verify WhatsApp Cloud API credentials.',
+                whatsappFailureSummary('Automated WhatsApp message failed', waErr),
                 JSON.stringify({
                   title: 'Automation WhatsApp Failed',
                   automationJobId: job.id,
                   error: waErr?.message || 'Unknown error',
                   errorCode: waErr?.code || null,
+                  providerCode: waErr?.providerCode || null,
+                  providerSubcode: waErr?.providerSubcode || null,
+                  providerType: waErr?.providerType || null,
+                  providerTraceId: waErr?.providerTraceId || null,
+                  statusCode: waErr?.statusCode || null,
                 }),
               ]
             );

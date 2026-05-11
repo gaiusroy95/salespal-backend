@@ -34,13 +34,42 @@ function sarvamLanguageFromLocale(locale) {
   if (l.startsWith('pa')) return 'pa-IN';
   if (l.startsWith('ur')) return 'ur-IN';
   if (l.startsWith('en')) return 'en-IN';
-  return 'hi-IN';
+  return 'en-IN';
 }
 
-/** STT: treat Hinglish / unknown lead locale as auto-detect. */
+const SARVAM_NATIVE_LOCALES = new Set([
+  'hi', 'mr', 'ta', 'te', 'kn', 'ml', 'gu', 'bn', 'pa', 'ur', 'en', 'hing', 'hinglish',
+]);
+
+function isSarvamNativeLocale(locale) {
+  const l = String(locale || '').toLowerCase().replace(/-.*/, '').replace(/_.*/, '');
+  return SARVAM_NATIVE_LOCALES.has(l);
+}
+
+/**
+ * Extended locale-to-display-name mapping used for AI system prompt language instructions.
+ * Covers Indian + major global languages.
+ */
+const LOCALE_DISPLAY_NAMES = {
+  hi: 'Hindi', hing: 'Hinglish (Hindi + English)', en: 'English',
+  mr: 'Marathi', ta: 'Tamil', te: 'Telugu', kn: 'Kannada', ml: 'Malayalam',
+  gu: 'Gujarati', bn: 'Bengali', pa: 'Punjabi', ur: 'Urdu',
+  ar: 'Arabic', es: 'Spanish', fr: 'French', de: 'German',
+  ja: 'Japanese', ko: 'Korean', zh: 'Chinese (Mandarin)',
+  pt: 'Portuguese', ru: 'Russian', it: 'Italian', nl: 'Dutch',
+  tr: 'Turkish', th: 'Thai', vi: 'Vietnamese', id: 'Indonesian',
+};
+
+function localeDisplayName(locale) {
+  const l = String(locale || '').toLowerCase().replace(/_.*/, '').replace(/-.*/, '');
+  return LOCALE_DISPLAY_NAMES[l] || locale || 'auto-detect';
+}
+
+/** STT: treat Hinglish / unknown lead locale as auto-detect. Non-Sarvam-native languages also use auto-detect. */
 function sttLanguageCodeFromLocale(locale) {
   const l = String(locale || '').toLowerCase().replace('_', '-');
-  if (!l || l === 'hing' || l === 'hinglish' || l === 'mixed') return 'unknown';
+  if (!l || l === 'hing' || l === 'hinglish' || l === 'mixed' || l === 'auto') return 'unknown';
+  if (!isSarvamNativeLocale(locale)) return 'unknown';
   return sarvamLanguageFromLocale(locale);
 }
 
@@ -221,8 +250,11 @@ module.exports = {
   DEFAULT_TTS_URL,
   DEFAULT_STT_URL,
   isSarvamTtsConfigured,
+  isSarvamNativeLocale,
   sarvamLanguageFromLocale,
   sttLanguageCodeFromLocale,
   transcribeBufferedAudio,
   synthesizeSpeech,
+  localeDisplayName,
+  LOCALE_DISPLAY_NAMES,
 };

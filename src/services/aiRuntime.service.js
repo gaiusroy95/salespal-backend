@@ -457,6 +457,42 @@ function buildStrictTelephonyProjectOpener({ locale, contactName, projectName, p
     const tail = fact ? ` ${fact}` : '';
     return `Hello ${ji}, ${agent} here. I'm calling only about the ${pn} listing — nothing else on this line.${tail} Should we start with location, pricing, or a site visit?`;
   }
+  if (/^(ar)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `\u0645\u0631\u062D\u0628\u0627 ${first}, \u0623\u0646\u0627 ${agent}. \u0647\u0630\u0647 \u0627\u0644\u0645\u0643\u0627\u0644\u0645\u0629 \u0641\u0642\u0637 \u062D\u0648\u0644 ${pn}.${tail} \u0645\u0627\u0630\u0627 \u062A\u0631\u064A\u062F \u0645\u0639\u0631\u0641\u062A\u0647 \u0623\u0648\u0644\u0627\u064B\u061F`;
+  }
+  if (/^(es)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Hola ${first}, soy ${agent}. Esta llamada es solo sobre ${pn}.${tail} \u00BFQu\u00E9 le gustar\u00EDa saber primero?`;
+  }
+  if (/^(fr)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Bonjour ${first}, je suis ${agent}. Cet appel concerne uniquement ${pn}.${tail} Que souhaitez-vous savoir en premier?`;
+  }
+  if (/^(de)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Hallo ${first}, hier ist ${agent}. Dieser Anruf betrifft nur ${pn}.${tail} Was m\u00F6chten Sie zuerst wissen?`;
+  }
+  if (/^(ja)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `\u3053\u3093\u306B\u3061\u306F${first}\u3055\u3093\u3001${agent}\u3067\u3059\u3002\u3053\u306E\u96FB\u8A71\u306F${pn}\u306B\u3064\u3044\u3066\u306E\u307F\u3067\u3059\u3002${tail}\u307E\u305A\u4F55\u3092\u304A\u77E5\u308A\u306B\u306A\u308A\u305F\u3044\u3067\u3059\u304B\uFF1F`;
+  }
+  if (/^(ko)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `\uC548\uB155\uD558\uC138\uC694 ${first}\uB2D8, ${agent}\uC785\uB2C8\uB2E4. \uC774 \uC804\uD654\uB294 ${pn}\uC5D0 \uB300\uD574\uC11C\uB9CC \uC548\uB0B4\uB4DC\uB9BD\uB2C8\uB2E4.${tail} \uBB34\uC5C7\uC744 \uBA3C\uC800 \uC54C\uACE0 \uC2F6\uC73C\uC2E0\uAC00\uC694?`;
+  }
+  if (/^(zh)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `\u4F60\u597D ${first}\uFF0C\u6211\u662F${agent}\u3002\u8FD9\u6B21\u901A\u8BDD\u53EA\u5173\u4E8E${pn}\u3002${tail}\u60A8\u60F3\u5148\u4E86\u89E3\u4EC0\u4E48\uFF1F`;
+  }
+  if (/^(pt)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `Ol\u00E1 ${first}, aqui \u00E9 ${agent}. Esta liga\u00E7\u00E3o \u00E9 apenas sobre ${pn}.${tail} O que gostaria de saber primeiro?`;
+  }
+  if (/^(ru)(-|)/.test(loc)) {
+    const tail = fact ? ` ${fact}` : '';
+    return `\u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439\u0442\u0435 ${first}, \u044D\u0442\u043E ${agent}. \u042D\u0442\u043E\u0442 \u0437\u0432\u043E\u043D\u043E\u043A \u0442\u043E\u043B\u044C\u043A\u043E \u043E ${pn}.${tail} \u0427\u0442\u043E \u0432\u044B \u0445\u043E\u0442\u0438\u0442\u0435 \u0443\u0437\u043D\u0430\u0442\u044C \u0432 \u043F\u0435\u0440\u0432\u0443\u044E \u043E\u0447\u0435\u0440\u0435\u0434\u044C?`;
+  }
   const tail = fact ? ` ${fact}` : '';
   return `Hello ${ji}, this is ${agent}. This call is only about ${pn}.${tail} What would you like to know first — location, pricing, or timeline?`;
 }
@@ -950,7 +986,7 @@ async function createVoiceSession({
   };
 }
 
-async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
+async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLocale }) {
   const row = await loadVoiceSession(conversationId);
   assertVoiceSessionAccess(row, { orgId, userId });
   const mdEarly = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
@@ -986,7 +1022,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId }) {
 
   const leadFirst = String(row.contact_name || 'User').trim().split(/\s+/)[0] || 'there';
   const honorificLead = honorificNameJi(String(row.contact_name || '').trim()) || `${leadFirst} Ji`;
-  const sessionLocale = row.locale || 'hing';
+  const sessionLocale = detectedLocale || row.locale || 'hing';
   const md = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
   const projectId = md.projectId || null;
   const voicePersona = String(md.voicePersona || '').trim().toLowerCase();
@@ -1117,9 +1153,10 @@ IDENTITY:
 LANGUAGE — HIGHEST PRIORITY (Regional fluency + global):
 - Respond in exactly the languages / dialects / scripts of the **last user utterance** — including simultaneous code-switch (e.g. Hinglish: English nouns + Hindi grammar). Mirror blend, slang, fillers, rhythm.
 - **India:** Fluent mode for Hindi, Marathi, Tamil, Telugu, Bengali, Kannada, Malayalam, Gujarati, Punjabi mixes, Urdu-English — never force pure English unless the lead used English only that turn.
+- **Global languages:** Full fluency for Spanish, French, German, Portuguese, Russian, Japanese, Korean, Chinese (Mandarin), Arabic, Turkish, Thai, Vietnamese, Indonesian, Italian, Dutch — respond natively in any of these when the lead speaks them.
 - **Middle East / international:** If Arabic or Arabic-English mix appears, mirror it; UAE-style English is fine when they use it exclusively.
 - **Only rule:** Reply language = **last user utterance** only. Earlier assistant lines may differ — ignore their language choices.
-- Session default (${sessionLocale}) applies only when the utterance is unintelligible noise.
+- Session default (${sessionLocale}) applies only when the utterance is unintelligible noise or the very first greeting.
 
 ADDRESSING PROTOCOL (Indian etiquette — “Ji” engine):
 - When politely addressing by name (especially Hindi / Indian English), use CRM spelling exactly: **"${honorificLead}"** — pronounce respectfully—do not caricature or Anglicise unnecessarily.

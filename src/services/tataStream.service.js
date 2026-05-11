@@ -163,6 +163,7 @@ function createStreamSession(streamSid, callSid, meta) {
     orgId: meta.orgId || null,
     userId: meta.userId || null,
     locale: meta.locale || 'hing',
+    detectedLocale: null,
     projectName: meta.projectName || null,
     audioBuffer: [],
     totalBufferedBytes: 0,
@@ -176,6 +177,50 @@ function createStreamSession(streamSid, callSid, meta) {
     closed: false,
     createdAt: Date.now(),
   };
+}
+
+/**
+ * Detect language from Sarvam STT response or transcript content.
+ * Returns a SalesPal locale code (e.g., 'hi', 'en', 'ta') or null.
+ */
+function detectLanguageFromStt(sttResult, transcript) {
+  const langReq = String(sttResult?.language_requested || '').toLowerCase();
+  const langDet = String(sttResult?.language_code || sttResult?.detected_language || '').toLowerCase();
+
+  if (langDet && langDet !== 'unknown') {
+    const code = langDet.replace(/-.*/, '');
+    if (code.length >= 2) return code;
+  }
+
+  if (!transcript) return null;
+  const t = transcript.toLowerCase();
+
+  if (/[\u0900-\u097F]/.test(t)) return 'hi';
+  if (/[\u0B80-\u0BFF]/.test(t)) return 'ta';
+  if (/[\u0C00-\u0C7F]/.test(t)) return 'te';
+  if (/[\u0C80-\u0CFF]/.test(t)) return 'kn';
+  if (/[\u0D00-\u0D7F]/.test(t)) return 'ml';
+  if (/[\u0A80-\u0AFF]/.test(t)) return 'gu';
+  if (/[\u0980-\u09FF]/.test(t)) return 'bn';
+  if (/[\u0A00-\u0A7F]/.test(t)) return 'pa';
+  if (/[\u0600-\u06FF]/.test(t)) return /\b(aur|hai|ka|ki|kya|hoon|ye|mein)\b/i.test(t) ? 'ur' : 'ar';
+  if (/[\u0E00-\u0E7F]/.test(t)) return 'th';
+  if (/[\u3040-\u309F\u30A0-\u30FF]/.test(t)) return 'ja';
+  if (/[\uAC00-\uD7AF]/.test(t)) return 'ko';
+  if (/[\u4E00-\u9FFF]/.test(t)) return 'zh';
+  if (/[\u0400-\u04FF]/.test(t)) return 'ru';
+
+  if (/\b(haan|nahi|acha|kya|hai|hoon|kar|mein|aap|kaise)\b/i.test(t)) return 'hing';
+  if (/\b(gracias|hola|por favor|bueno|si)\b/i.test(t)) return 'es';
+  if (/\b(merci|bonjour|oui|s'il vous|bien)\b/i.test(t)) return 'fr';
+  if (/\b(danke|bitte|ja|nein|gut)\b/i.test(t)) return 'de';
+  if (/\b(obrigado|sim|n[aã]o|bom)\b/i.test(t)) return 'pt';
+
+  return null;
+}
+
+function effectiveLocale(session) {
+  return session.detectedLocale || session.locale || 'hing';
 }
 
 // ─── Core pipeline ──────────────────────────────────────────────────────────
@@ -197,10 +242,12 @@ async function processUtterance(session) {
     const pcm16_8k = mulawBufToPcm16(mulawFull);
     const wavBuf = wrapPcm16AsWav(pcm16_8k, 8000);
 
+    const currentLocale = effectiveLocale(session);
     logger.info('[tataStream] STT start', {
       streamSid: session.streamSid,
       audioBytes: mulawFull.length,
       durationSec: (mulawFull.length / 8000).toFixed(1),
+      locale: currentLocale,
     });
 
     const sttResult = await sarvamService.transcribeBufferedAudio({
@@ -208,7 +255,7 @@ async function processUtterance(session) {
       buffer: wavBuf,
       filename: 'tata_utterance.wav',
       mimeType: 'audio/wav',
-      locale: session.locale,
+      locale: currentLocale,
     });
 
     const transcript = String(sttResult?.transcript || '').trim();
@@ -218,13 +265,26 @@ async function processUtterance(session) {
       return;
     }
 
-    logger.info('[tataStream] STT result', { streamSid: session.streamSid, transcript: transcript.slice(0, 200) });
+    const newLocale = detectLanguageFromStt(sttResult, transcript);
+    if (newLocale && newLocale !== session.detectedLocale) {
+      const prev = session.detectedLocale || session.locale;
+      session.detectedLocale = newLocale;
+      logger.info('[tataStream] Language switched', {
+        streamSid: session.streamSid,
+        from: prev,
+        to: newLocale,
+        transcript: transcript.slice(0, 80),
+      });
+    }
+
+    logger.info('[tataStream] STT result', { streamSid: session.streamSid, transcript: transcript.slice(0, 200), locale: effectiveLocale(session) });
 
     const turnResult = await aiRuntime.handleVoiceTurn({
       conversationId: session.conversationId,
       text: transcript,
       orgId: session.orgId,
       userId: session.userId,
+      detectedLocale: effectiveLocale(session),
     });
 
     const reply = String(turnResult?.reply || '').trim();
@@ -252,10 +312,11 @@ async function streamTtsToTata(session, text) {
   if (session.closed || !session.ws) return;
 
   try {
+    const ttsLocale = effectiveLocale(session);
     const ttsResult = await sarvamService.synthesizeSpeech({
       env,
       text,
-      locale: session.locale,
+      locale: ttsLocale,
       speechSampleRate: '8000',
     });
 

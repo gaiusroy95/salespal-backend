@@ -138,9 +138,9 @@ function stripWavHeader(wavBuf) {
 
 // ─── Voice Activity Detection (energy-based) ────────────────────────────────
 
-const SILENCE_THRESHOLD = 350;
-const SILENCE_FRAMES_NEEDED = 12;
-const MAX_BUFFER_SECONDS = 15;
+const SILENCE_THRESHOLD = 150;
+const SILENCE_FRAMES_NEEDED = 20;
+const MAX_BUFFER_SECONDS = 12;
 const MIN_SPEECH_BYTES = 1600;
 
 function computeEnergy(mulawBuf) {
@@ -172,6 +172,7 @@ function createStreamSession(streamSid, callSid, meta) {
     silenceFrameCount: 0,
     isSpeaking: false,
     processing: false,
+    botSpeaking: false,
     outChunkCounter: 0,
     openerPlayed: false,
     openerText: meta.openerText || '',
@@ -230,11 +231,17 @@ function effectiveLocale(session) {
 async function processUtterance(session) {
   if (session.processing || session.closed) return;
   if (session.totalBufferedBytes < MIN_SPEECH_BYTES) {
+    logger.debug('[tataStream] Too little audio, discarding', {
+      streamSid: session.streamSid,
+      bytes: session.totalBufferedBytes,
+      minRequired: MIN_SPEECH_BYTES,
+    });
     session.audioBuffer = [];
     session.totalBufferedBytes = 0;
     return;
   }
   session.processing = true;
+  const pipelineStartMs = Date.now();
   const audioChunks = session.audioBuffer.splice(0);
   session.totalBufferedBytes = 0;
   session.silenceFrameCount = 0;
@@ -252,6 +259,7 @@ async function processUtterance(session) {
       locale: currentLocale,
     });
 
+    const sttStartMs = Date.now();
     const sttResult = await sarvamService.transcribeBufferedAudio({
       env,
       buffer: wavBuf,
@@ -259,10 +267,14 @@ async function processUtterance(session) {
       mimeType: 'audio/wav',
       locale: currentLocale,
     });
+    const sttMs = Date.now() - sttStartMs;
 
     const transcript = String(sttResult?.transcript || '').trim();
     if (!transcript) {
-      logger.info('[tataStream] Empty transcript — skipping AI turn', { streamSid: session.streamSid });
+      logger.info('[tataStream] Empty transcript — skipping AI turn', {
+        streamSid: session.streamSid,
+        sttMs,
+      });
       session.processing = false;
       return;
     }
@@ -279,7 +291,12 @@ async function processUtterance(session) {
       });
     }
 
-    logger.info('[tataStream] STT result', { streamSid: session.streamSid, transcript: transcript.slice(0, 200), locale: effectiveLocale(session) });
+    logger.info('[tataStream] STT result', {
+      streamSid: session.streamSid,
+      transcript: transcript.slice(0, 200),
+      locale: effectiveLocale(session),
+      sttMs,
+    });
 
     if (!session.conversationId) {
       logger.warn('[tataStream] No conversationId — cannot process AI turn', { streamSid: session.streamSid });
@@ -287,6 +304,7 @@ async function processUtterance(session) {
       return;
     }
 
+    const aiStartMs = Date.now();
     const turnResult = await aiRuntime.handleVoiceTurn({
       conversationId: session.conversationId,
       text: transcript,
@@ -294,17 +312,32 @@ async function processUtterance(session) {
       userId: session.userId,
       detectedLocale: effectiveLocale(session),
     });
+    const aiMs = Date.now() - aiStartMs;
 
     const reply = String(turnResult?.reply || '').trim();
     if (!reply) {
-      logger.warn('[tataStream] AI returned empty reply', { streamSid: session.streamSid });
+      logger.warn('[tataStream] AI returned empty reply', { streamSid: session.streamSid, aiMs });
       session.processing = false;
       return;
     }
 
-    logger.info('[tataStream] AI reply', { streamSid: session.streamSid, reply: reply.slice(0, 200) });
+    logger.info('[tataStream] AI reply', {
+      streamSid: session.streamSid,
+      reply: reply.slice(0, 200),
+      aiMs,
+    });
 
     await streamTtsToTata(session, reply);
+
+    const totalMs = Date.now() - pipelineStartMs;
+    logger.info('[tataStream] Pipeline complete', {
+      streamSid: session.streamSid,
+      sttMs,
+      aiMs,
+      totalMs,
+      transcript: transcript.slice(0, 60),
+      reply: reply.slice(0, 60),
+    });
   } catch (err) {
     logger.error('[tataStream] Pipeline error', {
       streamSid: session.streamSid,
@@ -334,7 +367,9 @@ async function streamTtsToTata(session, text) {
   }
 
   try {
+    session.botSpeaking = true;
     const ttsLocale = effectiveLocale(session);
+    const ttsStartMs = Date.now();
     logger.info('[tataStream] TTS synthesis starting', {
       streamSid: session.streamSid,
       textLen: text.length,
@@ -344,12 +379,15 @@ async function streamTtsToTata(session, text) {
       env,
       text,
       locale: ttsLocale,
-      speechSampleRate: '8000',
+      speaker: process.env.SARVAM_TTS_SPEAKER || 'priya',
+      model: 'bulbul:v3',
+      speechSampleRate: '22050',
     });
 
     logger.info('[tataStream] TTS synthesis done', {
       streamSid: session.streamSid,
       wavBytes: ttsResult.buffer?.length || 0,
+      ttsMs: Date.now() - ttsStartMs,
     });
 
     let pcm8k;
@@ -406,15 +444,22 @@ async function streamTtsToTata(session, text) {
       }));
     }
 
+    const audioDurationSec = mulawOut.length / 8000;
     logger.info('[tataStream] TTS audio streamed to Tata', {
       streamSid: session.streamSid,
       textLen: text.length,
       mulawBytes: mulawOut.length,
-      durationSec: (mulawOut.length / 8000).toFixed(1),
+      durationSec: audioDurationSec.toFixed(1),
       chunksSent,
       wsOpen: session.ws?.readyState === 1,
+      ttsMs: Date.now() - ttsStartMs,
     });
+
+    const playbackWaitMs = Math.max(0, Math.round(audioDurationSec * 1000) - 200);
+    await new Promise(r => setTimeout(r, playbackWaitMs));
+    session.botSpeaking = false;
   } catch (err) {
+    session.botSpeaking = false;
     logger.error('[tataStream] TTS streaming failed', {
       streamSid: session.streamSid,
       error: err.message,
@@ -575,12 +620,50 @@ function handleTataConnection(ws, req) {
         const payload = msg.media?.payload;
         if (!payload) break;
 
+        if (!session._mediaFrameCount) session._mediaFrameCount = 0;
+        session._mediaFrameCount++;
+
+        if (session.botSpeaking) {
+          if (session._mediaFrameCount % 200 === 0) {
+            logger.debug('[tataStream] Ignoring media — bot is speaking', {
+              streamSid: session.streamSid,
+              frame: session._mediaFrameCount,
+            });
+          }
+          session.audioBuffer = [];
+          session.totalBufferedBytes = 0;
+          session.isSpeaking = false;
+          session.silenceFrameCount = 0;
+          break;
+        }
+
         const audioBuf = Buffer.from(payload, 'base64');
         const energy = computeEnergy(audioBuf);
+
+        if (session._mediaFrameCount <= 3 || session._mediaFrameCount % 200 === 0) {
+          logger.info('[tataStream] Media frame', {
+            streamSid: session.streamSid,
+            frame: session._mediaFrameCount,
+            energy: Math.round(energy),
+            threshold: SILENCE_THRESHOLD,
+            isSpeaking: session.isSpeaking,
+            processing: session.processing,
+            botSpeaking: session.botSpeaking,
+            bufferedBytes: session.totalBufferedBytes,
+          });
+        }
 
         if (energy > SILENCE_THRESHOLD) {
           if (session.processing) {
             clearTataAudio(session);
+            session.processing = false;
+          }
+          if (!session.isSpeaking) {
+            logger.info('[tataStream] Human speech detected', {
+              streamSid: session.streamSid,
+              energy: Math.round(energy),
+              frame: session._mediaFrameCount,
+            });
           }
           session.isSpeaking = true;
           session.silenceFrameCount = 0;
@@ -592,6 +675,13 @@ function handleTataConnection(ws, req) {
           session.totalBufferedBytes += audioBuf.length;
 
           if (session.silenceFrameCount >= SILENCE_FRAMES_NEEDED) {
+            logger.info('[tataStream] Human stopped speaking (2s silence) — processing', {
+              streamSid: session.streamSid,
+              bufferedBytes: session.totalBufferedBytes,
+              durationSec: (session.totalBufferedBytes / 8000).toFixed(1),
+              silenceMs: SILENCE_FRAMES_NEEDED * 100,
+              frame: session._mediaFrameCount,
+            });
             session.isSpeaking = false;
             session.silenceFrameCount = 0;
             processUtterance(session);
@@ -599,6 +689,10 @@ function handleTataConnection(ws, req) {
         }
 
         if (session.totalBufferedBytes > MAX_BUFFER_SECONDS * 8000) {
+          logger.info('[tataStream] Max buffer reached — forcing processing', {
+            streamSid: session.streamSid,
+            bufferedBytes: session.totalBufferedBytes,
+          });
           session.isSpeaking = false;
           processUtterance(session);
         }

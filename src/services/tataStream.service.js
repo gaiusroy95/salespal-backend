@@ -317,15 +317,39 @@ async function processUtterance(session) {
 }
 
 async function streamTtsToTata(session, text) {
-  if (session.closed || !session.ws) return;
+  if (session.closed) {
+    logger.warn('[tataStream] streamTtsToTata: session closed, skipping', { streamSid: session.streamSid });
+    return;
+  }
+  if (!session.ws) {
+    logger.warn('[tataStream] streamTtsToTata: no ws object, skipping', { streamSid: session.streamSid });
+    return;
+  }
+  if (session.ws.readyState !== 1) {
+    logger.warn('[tataStream] streamTtsToTata: ws not OPEN', {
+      streamSid: session.streamSid,
+      readyState: session.ws.readyState,
+    });
+    return;
+  }
 
   try {
     const ttsLocale = effectiveLocale(session);
+    logger.info('[tataStream] TTS synthesis starting', {
+      streamSid: session.streamSid,
+      textLen: text.length,
+      locale: ttsLocale,
+    });
     const ttsResult = await sarvamService.synthesizeSpeech({
       env,
       text,
       locale: ttsLocale,
       speechSampleRate: '8000',
+    });
+
+    logger.info('[tataStream] TTS synthesis done', {
+      streamSid: session.streamSid,
+      wavBytes: ttsResult.buffer?.length || 0,
     });
 
     let pcm8k;
@@ -337,6 +361,14 @@ async function streamTtsToTata(session, text) {
     }
 
     const mulawOut = pcm16ToMulawBuf(pcm8k);
+
+    logger.info('[tataStream] Audio encoded', {
+      streamSid: session.streamSid,
+      pcmBytes: pcm8k.length,
+      mulawBytes: mulawOut.length,
+      durationSec: (mulawOut.length / 8000).toFixed(1),
+      srcRate: sampleRate,
+    });
 
     const CHUNK_SIZE = 3200;
     for (let offset = 0; offset < mulawOut.length; offset += CHUNK_SIZE) {
@@ -364,6 +396,7 @@ async function streamTtsToTata(session, text) {
       }
     }
 
+    const chunksSent = session.outChunkCounter;
     const markName = `reply_${Date.now()}`;
     if (session.ws?.readyState === 1) {
       session.ws.send(JSON.stringify({
@@ -373,11 +406,13 @@ async function streamTtsToTata(session, text) {
       }));
     }
 
-    logger.info('[tataStream] TTS streamed', {
+    logger.info('[tataStream] TTS audio streamed to Tata', {
       streamSid: session.streamSid,
       textLen: text.length,
       mulawBytes: mulawOut.length,
       durationSec: (mulawOut.length / 8000).toFixed(1),
+      chunksSent,
+      wsOpen: session.ws?.readyState === 1,
     });
   } catch (err) {
     logger.error('[tataStream] TTS streaming failed', {
@@ -416,7 +451,7 @@ function handleTataConnection(ws, req) {
 
     switch (event) {
       case 'connected': {
-        logger.info('[tataStream] Handshake received', { connId });
+        logger.info('[tataStream] Handshake received (Tata confirmed connection)', { connId, url: req.url?.slice(0, 200) });
         break;
       }
 
@@ -425,23 +460,37 @@ function handleTataConnection(ws, req) {
         const streamSid = startData.streamSid || msg.streamSid || connId;
         const callSid = startData.callSid || '';
         const customParams = startData.customParameters || {};
+        const direction = String(startData.direction || '').toLowerCase();
+        const startFrom = String(startData.from || '').replace(/[^\d]/g, '');
+        const startTo = String(startData.to || '').replace(/[^\d]/g, '');
 
         let meta = parseSessionMeta(customParams, req);
 
-        logger.info('[tataStream] Parsed meta from customParams', {
-          connId, streamSid,
+        logger.info('[tataStream] START event received', {
+          connId, streamSid, callSid, direction,
+          startFrom: startFrom.slice(-4) || '(empty)',
+          startTo: startTo.slice(-4) || '(empty)',
           hasConversationId: Boolean(meta.conversationId),
           hasOpener: Boolean(meta.openerText),
           hasOrgId: Boolean(meta.orgId),
-          callerNumber: meta.callerNumber || '',
-          calledNumber: meta.calledNumber || '',
-          rawKeys: Object.keys(customParams || {}),
+          urlCallerNumber: meta.callerNumber || '(empty)',
+          urlCalledNumber: meta.calledNumber || '(empty)',
+          customParamKeys: Object.keys(customParams || {}),
+          customParamRaw: JSON.stringify(customParams).slice(0, 300),
         });
 
-        if (!meta.conversationId && meta.callerNumber) {
-          const phoneLookup = await lookupSessionByPhone(meta.callerNumber.replace(/[^\d]/g, ''));
+        const customerPhone =
+          direction === 'outbound' ? (startTo || meta.calledNumber) :
+          direction === 'inbound' ? (startFrom || meta.callerNumber) :
+          (startTo || startFrom || meta.calledNumber || meta.callerNumber);
+
+        if (!meta.conversationId && customerPhone) {
+          logger.info('[tataStream] No conversationId from params — looking up by customer phone', {
+            streamSid, customerPhone: customerPhone.slice(-4), direction,
+          });
+          const phoneLookup = await lookupSessionByPhone(customerPhone);
           if (phoneLookup) {
-            logger.info('[tataStream] Resolved session via caller phone', {
+            logger.info('[tataStream] Found session by phone', {
               streamSid,
               conversationId: phoneLookup.conversation_id,
             });
@@ -449,10 +498,17 @@ function handleTataConnection(ws, req) {
             if (dbCtx) {
               meta = { ...meta, ...dbCtx };
             }
+          } else {
+            logger.warn('[tataStream] No session found by phone', {
+              streamSid, customerPhone: customerPhone.slice(-4),
+            });
           }
         }
 
         if (meta.conversationId && !meta.openerText) {
+          logger.info('[tataStream] Have conversationId but no opener — loading from DB', {
+            streamSid, conversationId: meta.conversationId,
+          });
           const dbCtx = await loadSessionContext(meta.conversationId);
           if (dbCtx) {
             if (!meta.openerText && dbCtx.openerText) meta.openerText = dbCtx.openerText;
@@ -461,56 +517,55 @@ function handleTataConnection(ws, req) {
             if (!meta.projectName && dbCtx.projectName) meta.projectName = dbCtx.projectName;
             if (!meta.projectId && dbCtx.projectId) meta.projectId = dbCtx.projectId;
             if (!meta.leadName && dbCtx.leadName) meta.leadName = dbCtx.leadName;
-            logger.info('[tataStream] Enriched session from DB', {
+            logger.info('[tataStream] Enriched from DB', {
               streamSid,
               hasOpener: Boolean(meta.openerText),
-              projectName: meta.projectName || '',
+              openerLen: meta.openerText?.length || 0,
+              projectName: meta.projectName || '(none)',
             });
           }
         }
 
         session = createStreamSession(streamSid, callSid, meta);
         session.ws = ws;
+        session.direction = direction;
+        session.customerPhone = customerPhone || '';
         activeSessions.set(streamSid, session);
 
-        logger.info('[tataStream] Stream started', {
-          streamSid,
-          callSid,
-          conversationId: session.conversationId,
-          from: startData.from,
-          to: startData.to,
-          direction: startData.direction,
-          projectName: session.projectName,
+        logger.info('[tataStream] Session created', {
+          streamSid, callSid, direction,
+          conversationId: session.conversationId || '(none)',
+          projectName: session.projectName || '(none)',
           hasOpener: Boolean(session.openerText),
           openerLen: session.openerText?.length || 0,
+          openerPreview: session.openerText ? session.openerText.slice(0, 80) : '(empty)',
         });
 
-        if (session.conversationId) {
-          const openerToPlay = session.openerText;
-          if (openerToPlay) {
-            setTimeout(async () => {
-              try {
-                logger.info('[tataStream] Playing opener TTS', {
-                  streamSid,
-                  textLen: openerToPlay.length,
-                  text: openerToPlay.slice(0, 100),
-                });
-                await streamTtsToTata(session, openerToPlay);
-                session.openerPlayed = true;
-                logger.info('[tataStream] Opener TTS complete', { streamSid });
-              } catch (e) {
-                logger.error('[tataStream] Opener TTS failed', {
-                  streamSid,
-                  error: e.message,
-                  stack: e.stack?.slice(0, 300),
-                });
-              }
-            }, 500);
-          } else {
-            logger.warn('[tataStream] No opener text available — bot will wait for caller to speak first', { streamSid });
-          }
+        if (session.conversationId && session.openerText) {
+          setTimeout(async () => {
+            if (session.closed) return;
+            try {
+              logger.info('[tataStream] Sending opener TTS to caller', {
+                streamSid,
+                textLen: session.openerText.length,
+                text: session.openerText.slice(0, 120),
+                wsReady: session.ws?.readyState === 1,
+              });
+              await streamTtsToTata(session, session.openerText);
+              session.openerPlayed = true;
+              logger.info('[tataStream] Opener TTS delivered OK', { streamSid });
+            } catch (e) {
+              logger.error('[tataStream] Opener TTS FAILED', {
+                streamSid,
+                error: e.message,
+                stack: e.stack?.slice(0, 400),
+              });
+            }
+          }, 600);
+        } else if (session.conversationId && !session.openerText) {
+          logger.warn('[tataStream] Session exists but NO opener text — bot will wait for caller to speak', { streamSid });
         } else {
-          logger.warn('[tataStream] No conversationId — inbound call without session. Bot will respond generically.', { streamSid });
+          logger.warn('[tataStream] No conversationId — bot has no context', { streamSid, direction });
         }
         break;
       }
@@ -647,11 +702,21 @@ function parseSessionMeta(customParams, req) {
 
 /**
  * Attempt to find an existing voice session from the database
- * when custom_identifier doesn't carry conversationId (e.g. inbound calls).
- * Looks up by caller phone number for the most recent live session.
+ * when custom_identifier doesn't carry conversationId.
+ * Looks up by customer phone number for the most recent live session.
+ * Tries multiple phone formats (with/without country code).
  */
 async function lookupSessionByPhone(phoneDigits) {
   if (!phoneDigits || phoneDigits.length < 8) return null;
+
+  const ownNumber = String(env.telephony?.fromNumber || process.env.TATA_CALL_FROM_NUMBER || '').replace(/[^\d]/g, '');
+  if (ownNumber && phoneDigits.endsWith(ownNumber.slice(-10))) {
+    logger.info('[tataStream] lookupSessionByPhone: skipping — phone matches bot number', {
+      phone: phoneDigits.slice(-4),
+    });
+    return null;
+  }
+
   const suffixes = [phoneDigits];
   if (phoneDigits.startsWith('91') && phoneDigits.length === 12) suffixes.push(phoneDigits.slice(2));
   if (phoneDigits.length === 10) suffixes.push(`91${phoneDigits}`);
@@ -668,11 +733,18 @@ async function lookupSessionByPhone(phoneDigits) {
          LIMIT 1`,
         [`%${suffix.slice(-10)}`]
       );
-      if (rows[0]) return rows[0];
+      if (rows[0]) {
+        logger.info('[tataStream] lookupSessionByPhone: FOUND', {
+          phone: suffix.slice(-4),
+          conversationId: rows[0].conversation_id,
+        });
+        return rows[0];
+      }
     } catch (e) {
-      logger.warn('[tataStream] Phone lookup query failed', { error: e.message });
+      logger.warn('[tataStream] Phone lookup query failed', { error: e.message, suffix: suffix.slice(-4) });
     }
   }
+  logger.info('[tataStream] lookupSessionByPhone: no match', { phone: phoneDigits.slice(-4) });
   return null;
 }
 

@@ -165,6 +165,8 @@ function createStreamSession(streamSid, callSid, meta) {
     locale: meta.locale || 'hing',
     detectedLocale: null,
     projectName: meta.projectName || null,
+    projectId: meta.projectId || null,
+    leadName: meta.leadName || null,
     audioBuffer: [],
     totalBufferedBytes: 0,
     silenceFrameCount: 0,
@@ -278,6 +280,12 @@ async function processUtterance(session) {
     }
 
     logger.info('[tataStream] STT result', { streamSid: session.streamSid, transcript: transcript.slice(0, 200), locale: effectiveLocale(session) });
+
+    if (!session.conversationId) {
+      logger.warn('[tataStream] No conversationId — cannot process AI turn', { streamSid: session.streamSid });
+      session.processing = false;
+      return;
+    }
 
     const turnResult = await aiRuntime.handleVoiceTurn({
       conversationId: session.conversationId,
@@ -418,7 +426,48 @@ function handleTataConnection(ws, req) {
         const callSid = startData.callSid || '';
         const customParams = startData.customParameters || {};
 
-        const meta = parseSessionMeta(customParams, req);
+        let meta = parseSessionMeta(customParams, req);
+
+        logger.info('[tataStream] Parsed meta from customParams', {
+          connId, streamSid,
+          hasConversationId: Boolean(meta.conversationId),
+          hasOpener: Boolean(meta.openerText),
+          hasOrgId: Boolean(meta.orgId),
+          callerNumber: meta.callerNumber || '',
+          calledNumber: meta.calledNumber || '',
+          rawKeys: Object.keys(customParams || {}),
+        });
+
+        if (!meta.conversationId && meta.callerNumber) {
+          const phoneLookup = await lookupSessionByPhone(meta.callerNumber.replace(/[^\d]/g, ''));
+          if (phoneLookup) {
+            logger.info('[tataStream] Resolved session via caller phone', {
+              streamSid,
+              conversationId: phoneLookup.conversation_id,
+            });
+            const dbCtx = await loadSessionContext(phoneLookup.conversation_id);
+            if (dbCtx) {
+              meta = { ...meta, ...dbCtx };
+            }
+          }
+        }
+
+        if (meta.conversationId && !meta.openerText) {
+          const dbCtx = await loadSessionContext(meta.conversationId);
+          if (dbCtx) {
+            if (!meta.openerText && dbCtx.openerText) meta.openerText = dbCtx.openerText;
+            if (!meta.orgId && dbCtx.orgId) meta.orgId = dbCtx.orgId;
+            if (!meta.userId && dbCtx.userId) meta.userId = dbCtx.userId;
+            if (!meta.projectName && dbCtx.projectName) meta.projectName = dbCtx.projectName;
+            if (!meta.projectId && dbCtx.projectId) meta.projectId = dbCtx.projectId;
+            if (!meta.leadName && dbCtx.leadName) meta.leadName = dbCtx.leadName;
+            logger.info('[tataStream] Enriched session from DB', {
+              streamSid,
+              hasOpener: Boolean(meta.openerText),
+              projectName: meta.projectName || '',
+            });
+          }
+        }
 
         session = createStreamSession(streamSid, callSid, meta);
         session.ws = ws;
@@ -432,17 +481,36 @@ function handleTataConnection(ws, req) {
           to: startData.to,
           direction: startData.direction,
           projectName: session.projectName,
+          hasOpener: Boolean(session.openerText),
+          openerLen: session.openerText?.length || 0,
         });
 
-        if (session.openerText && session.conversationId) {
-          setImmediate(async () => {
-            try {
-              await streamTtsToTata(session, session.openerText);
-              session.openerPlayed = true;
-            } catch (e) {
-              logger.error('[tataStream] Opener TTS failed', { streamSid, error: e.message });
-            }
-          });
+        if (session.conversationId) {
+          const openerToPlay = session.openerText;
+          if (openerToPlay) {
+            setTimeout(async () => {
+              try {
+                logger.info('[tataStream] Playing opener TTS', {
+                  streamSid,
+                  textLen: openerToPlay.length,
+                  text: openerToPlay.slice(0, 100),
+                });
+                await streamTtsToTata(session, openerToPlay);
+                session.openerPlayed = true;
+                logger.info('[tataStream] Opener TTS complete', { streamSid });
+              } catch (e) {
+                logger.error('[tataStream] Opener TTS failed', {
+                  streamSid,
+                  error: e.message,
+                  stack: e.stack?.slice(0, 300),
+                });
+              }
+            }, 500);
+          } else {
+            logger.warn('[tataStream] No opener text available — bot will wait for caller to speak first', { streamSid });
+          }
+        } else {
+          logger.warn('[tataStream] No conversationId — inbound call without session. Bot will respond generically.', { streamSid });
         }
         break;
       }
@@ -536,13 +604,26 @@ function handleTataConnection(ws, req) {
 
 /**
  * Extract session metadata from Smartflo customParameters or query string.
- * The custom_identifier JSON (set during click_to_call_support) may arrive
- * in customParameters or we decode it from the connection URL query.
+ * The custom_identifier JSON (set during click_to_call_support) may arrive:
+ *   1. In customParameters object (decoded)
+ *   2. In customParameters.custom_identifier (stringified JSON)
+ *   3. In the WebSocket connection URL query parameters
+ * We try all sources and merge.
  */
 function parseSessionMeta(customParams, req) {
-  let cid = customParams;
-  if (typeof customParams === 'string') {
+  let cid = {};
+
+  if (customParams && typeof customParams === 'object') {
+    if (typeof customParams.custom_identifier === 'string') {
+      try { cid = JSON.parse(customParams.custom_identifier); } catch { cid = customParams; }
+    } else {
+      cid = { ...customParams };
+    }
+  } else if (typeof customParams === 'string') {
     try { cid = JSON.parse(customParams); } catch { cid = {}; }
+    if (typeof cid === 'string') {
+      try { cid = JSON.parse(cid); } catch { cid = {}; }
+    }
   }
 
   const url = new URL(req.url || '/', `wss://${req.headers.host || 'localhost'}`);
@@ -555,9 +636,81 @@ function parseSessionMeta(customParams, req) {
   const userId = cid.userId || cid.user_id || qUserId || null;
   const locale = cid.locale || url.searchParams.get('locale') || 'hing';
   const projectName = cid.project_name || cid.projectName || '';
+  const projectId = cid.project_id || cid.projectId || '';
   const openerText = cid.opener || '';
+  const leadName = cid.lead_name || cid.leadName || '';
+  const callerNumber = url.searchParams.get('fromNumber') || url.searchParams.get('from') || '';
+  const calledNumber = url.searchParams.get('toNumber') || url.searchParams.get('to') || '';
 
-  return { conversationId, orgId, userId, locale, projectName, openerText };
+  return { conversationId, orgId, userId, locale, projectName, projectId, openerText, leadName, callerNumber, calledNumber };
+}
+
+/**
+ * Attempt to find an existing voice session from the database
+ * when custom_identifier doesn't carry conversationId (e.g. inbound calls).
+ * Looks up by caller phone number for the most recent live session.
+ */
+async function lookupSessionByPhone(phoneDigits) {
+  if (!phoneDigits || phoneDigits.length < 8) return null;
+  const suffixes = [phoneDigits];
+  if (phoneDigits.startsWith('91') && phoneDigits.length === 12) suffixes.push(phoneDigits.slice(2));
+  if (phoneDigits.length === 10) suffixes.push(`91${phoneDigits}`);
+
+  for (const suffix of suffixes) {
+    try {
+      const { rows } = await db.query(
+        `SELECT conversation_id, org_id, user_id, locale, metadata, contact_name
+         FROM ai_voice_sessions
+         WHERE contact_phone LIKE $1
+           AND state = 'live'
+           AND created_at > NOW() - INTERVAL '30 minutes'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [`%${suffix.slice(-10)}`]
+      );
+      if (rows[0]) return rows[0];
+    } catch (e) {
+      logger.warn('[tataStream] Phone lookup query failed', { error: e.message });
+    }
+  }
+  return null;
+}
+
+/**
+ * Attempt to load opener text and project context from a voice session in DB
+ * when the WebSocket custom_identifier didn't carry it.
+ */
+async function loadSessionContext(conversationId) {
+  if (!conversationId) return null;
+  try {
+    const { rows } = await db.query(
+      `SELECT conversation_id, org_id, user_id, locale, contact_name, metadata FROM ai_voice_sessions WHERE conversation_id = $1`,
+      [conversationId]
+    );
+    if (!rows[0]) return null;
+    const row = rows[0];
+    const md = (typeof row.metadata === 'object' && row.metadata) ? row.metadata : {};
+
+    const { rows: turnRows } = await db.query(
+      `SELECT content FROM ai_voice_turns WHERE conversation_id = $1 AND role = 'assistant' ORDER BY created_at ASC LIMIT 1`,
+      [conversationId]
+    );
+    const opener = turnRows[0]?.content || '';
+
+    return {
+      conversationId: row.conversation_id,
+      orgId: row.org_id,
+      userId: row.user_id,
+      locale: row.locale || 'hing',
+      projectName: md.voiceProjectName || '',
+      projectId: md.projectId || '',
+      openerText: opener,
+      leadName: row.contact_name || '',
+    };
+  } catch (e) {
+    logger.warn('[tataStream] loadSessionContext failed', { conversationId, error: e.message });
+    return null;
+  }
 }
 
 // ─── Dynamic endpoint handler ───────────────────────────────────────────────
@@ -588,20 +741,40 @@ function buildWssUrl(req) {
 /**
  * POST /webhooks/tata/voice-stream-resolve
  * Smartflo Dynamic Endpoint — must respond within 2000 ms with { success, wss_url }.
+ * Also parses custom_identifier from the request body so we can pass context via URL query
+ * (as backup when Tata doesn't forward customParameters in the WebSocket start event).
  */
 function handleVoiceStreamResolve(req, res) {
   try {
-    const { callId, fromNumber, toNumber } = req.body || {};
+    const body = req.body || {};
+    const { callId, fromNumber, toNumber, custom_identifier } = body;
     const baseWss = buildWssUrl(req);
     const params = new URLSearchParams();
     if (callId) params.set('callId', callId);
     if (fromNumber) params.set('fromNumber', fromNumber);
     if (toNumber) params.set('toNumber', toNumber);
 
+    let cid = {};
+    if (custom_identifier) {
+      try {
+        cid = typeof custom_identifier === 'string' ? JSON.parse(custom_identifier) : custom_identifier;
+      } catch { cid = {}; }
+    }
+    if (cid.salespal_conversation_id) params.set('conversationId', cid.salespal_conversation_id);
+    if (cid.orgId) params.set('orgId', cid.orgId);
+    if (cid.userId) params.set('userId', cid.userId);
+    if (cid.locale) params.set('locale', cid.locale);
+
     const sep = baseWss.includes('?') ? '&' : '?';
     const wss_url = params.toString() ? `${baseWss}${sep}${params.toString()}` : baseWss;
 
-    logger.info('[tataStream] Dynamic endpoint resolved', { callId, wss_url: wss_url.slice(0, 120) });
+    logger.info('[tataStream] Dynamic endpoint resolved', {
+      callId,
+      fromNumber: fromNumber?.slice(-4) || '',
+      hasCustomId: Boolean(custom_identifier),
+      hasConvId: Boolean(cid.salespal_conversation_id),
+      wss_url: wss_url.slice(0, 200),
+    });
 
     return res.status(200).json({ success: true, wss_url });
   } catch (err) {

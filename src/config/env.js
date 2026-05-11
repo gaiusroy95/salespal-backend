@@ -269,6 +269,8 @@ const env = {
     staticPayload: parseJsonObject(parsed.TATA_CALL_STATIC_PAYLOAD, {}),
     webhookToken: parsed.TATA_WEBHOOK_TOKEN || '',
     webhookTokenHeader: parsed.TATA_WEBHOOK_TOKEN_HEADER || 'x-tata-webhook-token',
+    voiceBotWssUrl: String(parsed.TATA_VOICE_BOT_WSS_URL || '').trim(),
+    voiceStreamResolveUrl: String(parsed.TATA_VOICE_STREAM_RESOLVE_URL || '').trim(),
   },
   whatsapp: {
     enabled: String(parsed.WHATSAPP_ENABLED || 'false').toLowerCase() === 'true',

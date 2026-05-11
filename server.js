@@ -3,11 +3,14 @@ const env = require('./src/config/env');
 const logger = require('./src/config/logger');
 const db = require('./src/config/db');
 const salesController = require('./src/controllers/sales.controller');
+const tataStreamService = require('./src/services/tataStream.service');
 
 const server = app.listen(env.PORT, () => {
   logger.info(`🚀 SalesPal API server running on port ${env.PORT}`);
   logger.info(`   Environment: ${env.NODE_ENV}`);
 });
+
+tataStreamService.attachWebSocketServer(server);
 
 // ─── Background Sales Automation Dispatcher ───────────────────────────────────
 let automationDispatchTimer = null;

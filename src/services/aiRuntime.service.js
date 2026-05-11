@@ -927,11 +927,17 @@ async function createVoiceSession({
       projectName: voiceProjectName || null,
       projectId: projectId || null,
       locale: locale || 'hing',
+      orgId: orgId || null,
+      userId: userId || null,
     });
     const style = typeof telephony.apiStyle === 'string' ? telephony.apiStyle : tataVoiceService.resolveApiStyle();
     if (telephony.accepted && style === 'legacy') {
       telephony.integration_notice =
         'Handset playback is controlled by Smartflo’s legacy click-to-call leg; it does not read SalesPal’s opener. Migrate to Smartflo Voice Bot + /v1/click_to_call_support (backend .env.example) for listing-specific PSTN dialogue.';
+    }
+    if (telephony.accepted) {
+      telephony.voiceBotStreaming = true;
+      telephony.voiceBotWssUrl = env.telephony?.voiceBotWssUrl || null;
     }
   }
 

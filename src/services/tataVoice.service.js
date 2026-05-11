@@ -126,15 +126,17 @@ function bodyLooksRejected(data) {
 const OPENER_PAYLOAD_MAX_LEN = 950;
 const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
 
-function buildCustomIdentifierPayload({ conversationId, opener, projectName, projectId, leadName, locale }) {
+function buildCustomIdentifierPayload({ conversationId, opener, projectName, projectId, leadName, locale, orgId, userId }) {
   const base = {
-    v: 1,
+    v: 2,
     salespal_conversation_id: conversationId,
     project_name: projectName ? String(projectName).trim().slice(0, 240) : '',
     project_id: projectId ? String(projectId).trim().slice(0, 120) : '',
     opener: String(opener || '').trim().slice(0, 720),
     lead_name: leadName ? String(leadName).trim().slice(0, 120) : '',
     locale: locale ? String(locale).trim().slice(0, 40) : '',
+    orgId: orgId ? String(orgId).trim().slice(0, 60) : '',
+    userId: userId ? String(userId).trim().slice(0, 60) : '',
   };
   let s = JSON.stringify(base);
   if (s.length <= CUSTOM_IDENTIFIER_MAX_LEN) return s;
@@ -172,6 +174,8 @@ async function postLegacyClickToCall(apiUrl, headers, payloadBase) {
     projectId: pid,
     leadName,
     locale: payloadBase.locale,
+    orgId: payloadBase.orgId,
+    userId: payloadBase.userId,
   });
 
   const payload = {
@@ -245,12 +249,13 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
     projectId: pid,
     leadName: payloadBase.leadName,
     locale: payloadBase.locale,
+    orgId: payloadBase.orgId,
+    userId: payloadBase.userId,
   });
 
   const payload = {
     ...env.telephony.staticPayload,
     api_key: supportKey,
-    // Keep multiple aliases for Smartflo account variants.
     customer_number: destinationNumber,
     customerNumber: destinationNumber,
     destination_number: destinationNumber,
@@ -337,6 +342,8 @@ async function placeOutboundCall({
   projectName = null,
   projectId = null,
   locale = null,
+  orgId = null,
+  userId = null,
 }) {
   if (!isTelephonyEnabled()) {
     return {
@@ -390,6 +397,8 @@ async function placeOutboundCall({
     conversationId,
     leadName,
     locale,
+    orgId,
+    userId,
   };
 
   try {

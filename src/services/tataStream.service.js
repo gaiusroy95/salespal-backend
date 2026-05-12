@@ -25,6 +25,101 @@ const activeSessions = new Map();
 const pendingOutboundContext = new Map();
 const PENDING_CTX_TTL_MS = 120_000;
 
+async function createInboundVoiceSession(callerPhone) {
+  const crypto = require('crypto');
+  const conversationId = `vs_inbound_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+
+  let orgId = null;
+  let userId = null;
+  let projectId = null;
+  let projectName = null;
+  let openerText = '';
+  let locale = 'hing';
+
+  try {
+    const { rows: orgRows } = await db.query(
+      `SELECT o.id AS org_id, u.id AS user_id
+       FROM organizations o
+       JOIN users u ON u.org_id = o.id
+       WHERE u.role = 'admin' OR u.role = 'owner'
+       ORDER BY o.created_at DESC LIMIT 1`
+    );
+    if (orgRows[0]) {
+      orgId = orgRows[0].org_id;
+      userId = orgRows[0].user_id;
+    }
+  } catch (e) {
+    logger.warn('[tataStream] Could not resolve org for inbound call', { error: e.message });
+  }
+
+  if (orgId) {
+    try {
+      const { rows: projRows } = await db.query(
+        `SELECT p.id, p.name FROM projects p WHERE p.org_id = $1 AND p.archived_at IS NULL ORDER BY p.created_at DESC LIMIT 1`,
+        [orgId]
+      );
+      if (projRows[0]) {
+        projectId = projRows[0].id;
+        projectName = projRows[0].name;
+      }
+    } catch (e) {
+      logger.warn('[tataStream] Could not resolve project for inbound call', { error: e.message });
+    }
+  }
+
+  const agentName = 'SalesPal AI';
+  if (projectName) {
+    openerText = `Hello! Thank you for calling. I'm ${agentName}, and I'd be happy to help you with ${projectName}. How can I assist you today?`;
+  } else {
+    openerText = `Hello! Thank you for calling. I'm ${agentName}. How can I help you today?`;
+  }
+
+  try {
+    const metadata = {
+      projectId: projectId || null,
+      agentName,
+      voiceStylePersona: 'friendly_consultant',
+      voiceProjectName: projectName || null,
+      humanTakeoverActive: false,
+      voiceGender: 'unknown',
+      inboundAutoCreated: true,
+    };
+
+    await db.query(
+      `INSERT INTO ai_voice_sessions (
+        conversation_id, org_id, user_id, brand_id, lead_id, contact_phone, contact_name, locale, state, mode, metadata
+      ) VALUES ($1, $2, $3, 'inbound', NULL, $4, 'Inbound Caller', $5, 'live', 'voice', $6::jsonb)`,
+      [conversationId, orgId, userId, callerPhone || null, locale, JSON.stringify(metadata)]
+    );
+
+    await db.query(
+      `INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`,
+      [conversationId, openerText]
+    );
+
+    logger.info('[tataStream] Created inbound voice session', {
+      conversationId,
+      orgId,
+      projectId,
+      projectName,
+      callerPhone: callerPhone?.slice(-4),
+    });
+  } catch (e) {
+    logger.error('[tataStream] Failed to create inbound session', { error: e.message });
+  }
+
+  return {
+    conversationId,
+    orgId,
+    userId,
+    locale,
+    projectName: projectName || '',
+    projectId: projectId || '',
+    openerText,
+    leadName: 'Inbound Caller',
+  };
+}
+
 // ─── µ-law codec ────────────────────────────────────────────────────────────
 
 const MULAW_BIAS = 0x84;
@@ -236,21 +331,13 @@ function effectiveLocale(session) {
 function isGibberishTranscript(text) {
   if (!text) return true;
   const t = text.trim();
-  if (t.length < 2) return true;
-
-  const words = t.split(/\s+/).filter(w => w.length > 0);
-  if (words.length === 0) return true;
-
-  if (words.length === 1 && t.length < 4) return true;
-
-  const repeatedGreetings = /^(hello[.!,\s]*){3,}$/i;
-  if (repeatedGreetings.test(t)) return true;
+  if (t.length < 1) return true;
 
   const onlyFillers = /^[\s,.!?;:'"()…\-–—]+$/;
   if (onlyFillers.test(t)) return true;
 
   const uniqueChars = new Set(t.toLowerCase().replace(/[^a-z\u0900-\u0D7F]/g, ''));
-  if (t.length > 8 && uniqueChars.size <= 3) return true;
+  if (t.length > 15 && uniqueChars.size <= 2) return true;
 
   return false;
 }
@@ -420,7 +507,7 @@ async function processUtterance(session) {
         sentenceCount: sentences.length,
       });
       for (const sentence of sentences) {
-        if (session.closed || !session.botSpeaking && session.isSpeaking) break;
+        if (session.closed) break;
         await streamTtsToTata(session, sentence);
         if (session.closed) break;
       }
@@ -691,12 +778,14 @@ function handleTataConnection(ws, req) {
             }
           }
           if (!meta.conversationId) {
-            logger.warn('[tataStream] No session found by any phone candidate', {
+            const callerPhone = uniquePhones[0] || startFrom || startTo || '';
+            logger.info('[tataStream] No existing session — creating inbound session on the fly', {
               streamSid,
               direction,
-              candidateCount: uniquePhones.length,
-              lastDigits: uniquePhones.map(p => p.slice(-4)),
+              callerPhone: callerPhone.slice(-4),
             });
+            const inboundCtx = await createInboundVoiceSession(callerPhone);
+            meta = { ...meta, ...inboundCtx };
           }
         }
 

@@ -1208,7 +1208,7 @@ SPEECH OUTPUT RULES (your reply will be read aloud by text-to-speech):
 ${aiService.SALES_CONVERSATION_FUNNEL_BLOCK}
 ${aiService.humanStyleConsistencyBlock(voiceStylePersona)}`;
 
-  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.5, maxTokens: 150 });
+  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.5, maxTokens: 250 });
 
   await db.query(`INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`, [
     conversationId,

@@ -213,26 +213,74 @@ function vecToSql(vec) {
 }
 
 async function retrieveTopKSql({ projectId, orgId, queryText, k = 8 }) {
-  const qVec = await embedSingleText(queryText, 'RETRIEVAL_QUERY');
-  const vecStr = vecToSql(qVec);
-
+  // Strategy 1: pgvector similarity (requires working embeddings + extension)
   try {
-    const { rows } = await db.query(
-      `SELECT source_type, source_name, content, metadata, knowledge_version, created_at,
-              1 - (embedding_vec <=> $3::vector) AS score
-       FROM project_knowledge
-       WHERE project_id = $1 AND org_id = $2
-         AND embedding_vec IS NOT NULL
-       ORDER BY embedding_vec <=> $3::vector
-       LIMIT $4`,
-      [projectId, orgId, vecStr, k]
-    );
-    if (rows.length) return rows;
+    const qVec = await embedSingleText(queryText, 'RETRIEVAL_QUERY');
+    const isRealEmbedding = qVec.filter(v => v !== 0).length > 20;
+    if (isRealEmbedding) {
+      const vecStr = vecToSql(qVec);
+      const { rows } = await db.query(
+        `SELECT source_type, source_name, content, metadata, knowledge_version, created_at,
+                1 - (embedding_vec <=> $3::vector) AS score
+         FROM project_knowledge
+         WHERE project_id = $1 AND org_id = $2
+           AND embedding_vec IS NOT NULL
+         ORDER BY embedding_vec <=> $3::vector
+         LIMIT $4`,
+        [projectId, orgId, vecStr, k]
+      );
+      if (rows.length) return rows;
+    }
   } catch (err) {
-    logger.debug('[knowledge] pgvector query failed (fallback to in-memory)', { error: err.message });
+    logger.debug('[knowledge] pgvector search failed', { error: err.message });
   }
 
-  return retrieveTopKInMemory(qVec, projectId, orgId, k);
+  // Strategy 2: PostgreSQL full-text search (no external API needed)
+  try {
+    const terms = String(queryText || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\u0900-\u0D7F\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length > 2);
+    if (terms.length) {
+      const tsQuery = terms.map(t => `${t}:*`).join(' | ');
+      const { rows } = await db.query(
+        `SELECT source_type, source_name, content, metadata, knowledge_version, created_at,
+                ts_rank(to_tsvector('simple', content), to_tsquery('simple', $3)) AS score
+         FROM project_knowledge
+         WHERE project_id = $1 AND org_id = $2
+           AND to_tsvector('simple', content) @@ to_tsquery('simple', $3)
+         ORDER BY score DESC
+         LIMIT $4`,
+        [projectId, orgId, tsQuery, k]
+      );
+      if (rows.length) {
+        logger.debug('[knowledge] Full-text search returned results', { count: rows.length });
+        return rows;
+      }
+    }
+  } catch (err) {
+    logger.debug('[knowledge] Full-text search failed', { error: err.message });
+  }
+
+  // Strategy 3: return all project knowledge rows (small dataset fallback)
+  try {
+    const { rows } = await db.query(
+      `SELECT source_type, source_name, content, metadata, knowledge_version, created_at, 1.0 AS score
+       FROM project_knowledge
+       WHERE project_id = $1 AND org_id = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [projectId, orgId, k]
+    );
+    if (rows.length) {
+      logger.debug('[knowledge] Returning all project knowledge rows', { count: rows.length });
+    }
+    return rows;
+  } catch (err) {
+    logger.debug('[knowledge] Direct query failed', { error: err.message });
+    return [];
+  }
 }
 
 async function retrieveTopKInMemory(qVec, projectId, orgId, k = 8) {

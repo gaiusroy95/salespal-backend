@@ -288,15 +288,14 @@ function createStreamSession(streamSid, callSid, meta) {
  * Returns a SalesPal locale code (e.g., 'hi', 'en', 'ta') or null.
  */
 function detectLanguageFromStt(sttResult, transcript) {
-  const langReq = String(sttResult?.language_requested || '').toLowerCase();
-  const langDet = String(sttResult?.language_code || sttResult?.detected_language || '').toLowerCase();
+  if (!transcript || transcript.trim().length < 4) return null;
 
-  if (langDet && langDet !== 'unknown') {
+  const langDet = String(sttResult?.language_code || sttResult?.detected_language || '').toLowerCase();
+  if (langDet && langDet !== 'unknown' && transcript.trim().length >= 8) {
     const code = langDet.replace(/-.*/, '');
     if (code.length >= 2) return code;
   }
 
-  if (!transcript) return null;
   const t = transcript.toLowerCase();
 
   if (/[\u0900-\u097F]/.test(t)) return 'hi';
@@ -562,7 +561,7 @@ async function streamTtsToTata(session, rawText) {
   }
 
   try {
-    session.botSpeaking = true;
+    session._ttsSynthesizing = true;
     const ttsLocale = effectiveLocale(session);
     const ttsStartMs = Date.now();
     logger.info('[tataStream] TTS synthesis starting', {
@@ -578,6 +577,7 @@ async function streamTtsToTata(session, rawText) {
       model: 'bulbul:v3',
       speechSampleRate: '22050',
     });
+    session._ttsSynthesizing = false;
 
     logger.info('[tataStream] TTS synthesis done', {
       streamSid: session.streamSid,
@@ -594,6 +594,7 @@ async function streamTtsToTata(session, rawText) {
     }
 
     const mulawOut = pcm16ToMulawBuf(pcm8k);
+    session.botSpeaking = true;
 
     logger.info('[tataStream] Audio encoded', {
       streamSid: session.streamSid,
@@ -661,6 +662,7 @@ async function streamTtsToTata(session, rawText) {
     session._bargeInFrames = 0;
   } catch (err) {
     session.botSpeaking = false;
+    session._ttsSynthesizing = false;
     logger.error('[tataStream] TTS streaming failed', {
       streamSid: session.streamSid,
       error: err.message,
@@ -835,15 +837,21 @@ function handleTataConnection(ws, req) {
           setTimeout(async () => {
             if (session.closed) return;
             try {
-              logger.info('[tataStream] Sending opener TTS to caller', {
+              const sentences = splitIntoSentences(session.openerText);
+              logger.info('[tataStream] Sending opener TTS (sentence-streamed)', {
                 streamSid,
                 textLen: session.openerText.length,
-                text: session.openerText.slice(0, 120),
+                sentenceCount: sentences.length,
+                firstSentence: sentences[0]?.slice(0, 80),
                 wsReady: session.ws?.readyState === 1,
               });
-              await streamTtsToTata(session, session.openerText);
+              for (const sentence of sentences) {
+                if (session.closed) break;
+                await streamTtsToTata(session, sentence);
+                if (session.closed) break;
+              }
               session.openerPlayed = true;
-              logger.info('[tataStream] Opener TTS delivered OK', { streamSid });
+              logger.info('[tataStream] Opener TTS delivered OK', { streamSid, sentences: sentences.length });
             } catch (e) {
               logger.error('[tataStream] Opener TTS FAILED', {
                 streamSid,
@@ -868,12 +876,18 @@ function handleTataConnection(ws, req) {
         if (!session._mediaFrameCount) session._mediaFrameCount = 0;
         session._mediaFrameCount++;
 
+        // Ignore first ~1.5 seconds — phone line connection noise
+        if (session._mediaFrameCount <= 15) break;
+
+        // During TTS synthesis (API call in flight), ignore all incoming audio
+        if (session._ttsSynthesizing) break;
+
         if (session.botSpeaking) {
           const energy = computeEnergy(Buffer.from(payload, 'base64'));
-          if (energy > SILENCE_THRESHOLD * 1.5) {
+          if (energy > SILENCE_THRESHOLD * 2) {
             if (!session._bargeInFrames) session._bargeInFrames = 0;
             session._bargeInFrames++;
-            if (session._bargeInFrames >= 3) {
+            if (session._bargeInFrames >= 5) {
               logger.info('[tataStream] Barge-in detected — stopping bot speech', {
                 streamSid: session.streamSid,
                 energy: Math.round(energy),

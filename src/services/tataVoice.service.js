@@ -442,18 +442,22 @@ async function placeOutboundCall({
         if (supportResponse.status >= 200 && supportResponse.status < 300) {
           const supportData = supportResponse.data || {};
           const providerCallId = extractProviderCallId(supportData);
-          if (!bodyLooksRejected(supportData) && providerCallId) {
+          if (!bodyLooksRejected(supportData)) {
+            logger.info('[telephony] Support API accepted (2xx, not rejected)', {
+              has_provider_call_id: Boolean(providerCallId),
+              status: supportResponse.status,
+            });
             return {
               enabled: true,
               provider: 'tata',
               accepted: true,
               apiStyle: 'support',
               statusCode: supportResponse.status,
-              providerCallId,
+              providerCallId: providerCallId || `support_${Date.now()}`,
               raw: supportData,
             };
           }
-          logger.warn('[telephony] Support API responded but without reliable acceptance; falling back to legacy click_to_call', {
+          logger.warn('[telephony] Support API responded but body looks rejected; falling back to legacy click_to_call', {
             has_provider_call_id: Boolean(providerCallId),
             status: supportResponse.status,
           });

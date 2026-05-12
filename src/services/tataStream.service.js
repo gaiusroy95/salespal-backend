@@ -26,28 +26,26 @@ const pendingOutboundContext = new Map();
 const PENDING_CTX_TTL_MS = 120_000;
 
 async function createInboundVoiceSession(callerPhone) {
-  const crypto = require('crypto');
   const conversationId = `vs_inbound_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   let orgId = null;
   let userId = null;
   let projectId = null;
   let projectName = null;
-  let openerText = '';
   let locale = 'hing';
 
   try {
     const { rows: orgRows } = await db.query(
-      `SELECT o.id AS org_id, u.id AS user_id
-       FROM organizations o
-       JOIN users u ON u.org_id = o.id
-       WHERE u.role = 'admin' OR u.role = 'owner'
-       ORDER BY o.created_at DESC LIMIT 1`
+      `SELECT om.org_id, om.user_id
+       FROM org_members om
+       WHERE om.role IN ('owner', 'admin')
+       ORDER BY om.joined_at DESC LIMIT 1`
     );
     if (orgRows[0]) {
       orgId = orgRows[0].org_id;
       userId = orgRows[0].user_id;
     }
+    logger.info('[tataStream] Resolved org for inbound', { orgId, userId });
   } catch (e) {
     logger.warn('[tataStream] Could not resolve org for inbound call', { error: e.message });
   }
@@ -55,24 +53,23 @@ async function createInboundVoiceSession(callerPhone) {
   if (orgId) {
     try {
       const { rows: projRows } = await db.query(
-        `SELECT p.id, p.name FROM projects p WHERE p.org_id = $1 AND p.archived_at IS NULL ORDER BY p.created_at DESC LIMIT 1`,
+        `SELECT id, name FROM projects WHERE org_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
         [orgId]
       );
       if (projRows[0]) {
         projectId = projRows[0].id;
         projectName = projRows[0].name;
       }
+      logger.info('[tataStream] Resolved project for inbound', { projectId, projectName });
     } catch (e) {
       logger.warn('[tataStream] Could not resolve project for inbound call', { error: e.message });
     }
   }
 
   const agentName = 'SalesPal AI';
-  if (projectName) {
-    openerText = `Hello! Thank you for calling. I'm ${agentName}, and I'd be happy to help you with ${projectName}. How can I assist you today?`;
-  } else {
-    openerText = `Hello! Thank you for calling. I'm ${agentName}. How can I help you today?`;
-  }
+  const openerText = projectName
+    ? `Hello! Thank you for calling. I am ${agentName}, and I would be happy to help you with ${projectName}. How can I assist you today?`
+    : `Hello! Thank you for calling. I am ${agentName}. How can I help you today?`;
 
   try {
     const metadata = {
@@ -97,15 +94,22 @@ async function createInboundVoiceSession(callerPhone) {
       [conversationId, openerText]
     );
 
-    logger.info('[tataStream] Created inbound voice session', {
+    logger.info('[tataStream] Created inbound voice session OK', {
       conversationId,
       orgId,
+      userId,
       projectId,
       projectName,
       callerPhone: callerPhone?.slice(-4),
+      openerLen: openerText.length,
     });
   } catch (e) {
-    logger.error('[tataStream] Failed to create inbound session', { error: e.message });
+    logger.error('[tataStream] Failed to create inbound session in DB', {
+      error: e.message,
+      stack: e.stack?.slice(0, 300),
+      conversationId,
+      orgId,
+    });
   }
 
   return {
@@ -660,6 +664,8 @@ async function streamTtsToTata(session, rawText) {
     logger.error('[tataStream] TTS streaming failed', {
       streamSid: session.streamSid,
       error: err.message,
+      stack: err.stack?.slice(0, 500),
+      code: err.code || '',
     });
   }
 }

@@ -22,6 +22,8 @@ const aiRuntime = require('./aiRuntime.service');
 const db = require('../config/db');
 
 const activeSessions = new Map();
+const pendingOutboundContext = new Map();
+const PENDING_CTX_TTL_MS = 120_000;
 
 // ─── µ-law codec ────────────────────────────────────────────────────────────
 
@@ -637,23 +639,63 @@ function handleTataConnection(ws, req) {
           direction === 'inbound' ? (startFrom || meta.callerNumber) :
           (startTo || startFrom || meta.calledNumber || meta.callerNumber);
 
-        if (!meta.conversationId && customerPhone) {
-          logger.info('[tataStream] No conversationId from params — looking up by customer phone', {
-            streamSid, customerPhone: customerPhone.slice(-4), direction,
-          });
-          const phoneLookup = await lookupSessionByPhone(customerPhone);
-          if (phoneLookup) {
-            logger.info('[tataStream] Found session by phone', {
-              streamSid,
-              conversationId: phoneLookup.conversation_id,
-            });
-            const dbCtx = await loadSessionContext(phoneLookup.conversation_id);
-            if (dbCtx) {
-              meta = { ...meta, ...dbCtx };
+        const allPhoneCandidates = [
+          customerPhone,
+          startTo, startFrom,
+          meta.calledNumber, meta.callerNumber,
+        ].filter(Boolean).filter((p) => {
+          const ownNum = String(env.telephony?.fromNumber || process.env.TATA_CALL_FROM_NUMBER || '').replace(/[^\d]/g, '');
+          return !ownNum || !p.endsWith(ownNum.slice(-10));
+        });
+        const uniquePhones = [...new Set(allPhoneCandidates)];
+
+        if (!meta.conversationId) {
+          for (const phone of uniquePhones) {
+            if (!phone || phone.length < 8) continue;
+            const cacheKey = phone.slice(-10);
+            const cached = pendingOutboundContext.get(cacheKey);
+            if (cached) {
+              logger.info('[tataStream] Found outbound context in memory cache', {
+                streamSid, phone: cacheKey.slice(-4),
+                conversationId: cached.conversationId,
+              });
+              meta = { ...meta, ...cached };
+              pendingOutboundContext.delete(cacheKey);
+              if (meta.conversationId && !meta.openerText) {
+                const dbCtx = await loadSessionContext(meta.conversationId);
+                if (dbCtx && dbCtx.openerText) meta.openerText = dbCtx.openerText;
+              }
+              break;
             }
-          } else {
-            logger.warn('[tataStream] No session found by phone', {
-              streamSid, customerPhone: customerPhone.slice(-4),
+          }
+        }
+
+        if (!meta.conversationId) {
+          for (const phone of uniquePhones) {
+            if (!phone || phone.length < 8) continue;
+            logger.info('[tataStream] Looking up session by phone in DB', {
+              streamSid, phone: phone.slice(-4), direction,
+            });
+            const phoneLookup = await lookupSessionByPhone(phone);
+            if (phoneLookup) {
+              logger.info('[tataStream] Found session by phone', {
+                streamSid,
+                conversationId: phoneLookup.conversation_id,
+                matchedPhone: phone.slice(-4),
+              });
+              const dbCtx = await loadSessionContext(phoneLookup.conversation_id);
+              if (dbCtx) {
+                meta = { ...meta, ...dbCtx };
+              }
+              break;
+            }
+          }
+          if (!meta.conversationId) {
+            logger.warn('[tataStream] No session found by any phone candidate', {
+              streamSid,
+              direction,
+              candidateCount: uniquePhones.length,
+              lastDigits: uniquePhones.map(p => p.slice(-4)),
             });
           }
         }
@@ -1049,6 +1091,28 @@ function handleVoiceStreamResolve(req, res) {
     if (cid.orgId) params.set('orgId', cid.orgId);
     if (cid.userId) params.set('userId', cid.userId);
     if (cid.locale) params.set('locale', cid.locale);
+
+    if (cid.salespal_conversation_id) {
+      const ctxKey = String(toNumber || fromNumber || callId || '').replace(/[^\d]/g, '').slice(-10);
+      if (ctxKey) {
+        pendingOutboundContext.set(ctxKey, {
+          conversationId: cid.salespal_conversation_id,
+          orgId: cid.orgId || null,
+          userId: cid.userId || null,
+          locale: cid.locale || 'hing',
+          projectName: cid.project_name || '',
+          projectId: cid.project_id || '',
+          openerText: cid.opener || '',
+          leadName: cid.lead_name || '',
+          ts: Date.now(),
+        });
+        setTimeout(() => pendingOutboundContext.delete(ctxKey), PENDING_CTX_TTL_MS);
+        logger.info('[tataStream] Cached outbound context for phone lookup', {
+          ctxKey: ctxKey.slice(-4),
+          conversationId: cid.salespal_conversation_id,
+        });
+      }
+    }
 
     const sep = baseWss.includes('?') ? '&' : '?';
     const wss_url = params.toString() ? `${baseWss}${sep}${params.toString()}` : baseWss;

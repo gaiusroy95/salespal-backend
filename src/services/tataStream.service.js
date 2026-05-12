@@ -226,6 +226,34 @@ function effectiveLocale(session) {
   return session.detectedLocale || session.locale || 'hing';
 }
 
+/**
+ * Clean text before sending to TTS so the voice sounds natural.
+ * Removes URLs, emails, internal labels, code artifacts, and
+ * converts abbreviations to spoken form.
+ */
+function sanitizeTextForTts(text) {
+  let t = String(text || '');
+  t = t.replace(/https?:\/\/[^\s,)]+/gi, '');
+  t = t.replace(/www\.[^\s,)]+/gi, '');
+  t = t.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '');
+  t = t.replace(/\b(Brain Drive|indexed materials?|source_type|source_name|SalesPal|KNOWLEDGE BOUNDARY|PROJECT KNOWLEDGE|SELECTED PROJECT CONTEXT)\b/gi, '');
+  t = t.replace(/\[(website|document|pdf|file|url|excel|csv|text|source)\]/gi, '');
+  t = t.replace(/[{}\[\]<>|\\]/g, ' ');
+  t = t.replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1');
+  t = t.replace(/#{1,6}\s*/g, '');
+  t = t.replace(/`[^`]*`/g, '');
+  t = t.replace(/\bRs\.?\s*/gi, 'Rupees ');
+  t = t.replace(/\bsq\.?\s*ft\.?\b/gi, 'square feet');
+  t = t.replace(/\bBHK\b/gi, 'B H K');
+  t = t.replace(/\bEMI\b/gi, 'E M I');
+  t = t.replace(/\bRERA\b/gi, 'RERA');
+  t = t.replace(/\n{2,}/g, '. ');
+  t = t.replace(/\n/g, ', ');
+  t = t.replace(/\s{2,}/g, ' ');
+  t = t.replace(/[—–]{2,}/g, ', ');
+  return t.trim();
+}
+
 // ─── Core pipeline ──────────────────────────────────────────────────────────
 
 async function processUtterance(session) {
@@ -349,7 +377,7 @@ async function processUtterance(session) {
   }
 }
 
-async function streamTtsToTata(session, text) {
+async function streamTtsToTata(session, rawText) {
   if (session.closed) {
     logger.warn('[tataStream] streamTtsToTata: session closed, skipping', { streamSid: session.streamSid });
     return;
@@ -363,6 +391,12 @@ async function streamTtsToTata(session, text) {
       streamSid: session.streamSid,
       readyState: session.ws.readyState,
     });
+    return;
+  }
+
+  const text = sanitizeTextForTts(rawText);
+  if (!text) {
+    logger.warn('[tataStream] streamTtsToTata: text empty after sanitization', { streamSid: session.streamSid });
     return;
   }
 

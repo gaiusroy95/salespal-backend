@@ -427,6 +427,20 @@ function ensureOpenerNamesProjectListing(opener, projectName, locale) {
  * PSTN line sold to the lead: only the selected project (Smartflo portal bot often ignores extras;
  * this text is also embedded in `custom_identifier` for Voice Bot streaming integrations).
  */
+function sanitizeForSpeech(text) {
+  let t = String(text || '');
+  t = t.replace(/https?:\/\/[^\s,)]+/gi, '');
+  t = t.replace(/www\.[^\s,)]+/gi, '');
+  t = t.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '');
+  t = t.replace(/\b(Brain Drive|indexed materials?|source_type|source_name|CRM|SalesPal|RERA)\b/gi, '');
+  t = t.replace(/\[(website|document|pdf|file|url|excel|csv|text)\]/gi, '');
+  t = t.replace(/^(Project|Name|Category|Industry|Description)\s*[:/]\s*/gim, '');
+  t = t.replace(/[{}\[\]<>|\\]/g, '');
+  t = t.replace(/\s{2,}/g, ' ');
+  t = t.replace(/[—–-]{2,}/g, ' ');
+  return t.trim();
+}
+
 function buildStrictTelephonyProjectOpener({ locale, contactName, projectName, projectBrief, agentName }) {
   const pn = String(projectName || '').trim();
   const raw = String(contactName || '').trim();
@@ -436,10 +450,12 @@ function buildStrictTelephonyProjectOpener({ locale, contactName, projectName, p
   const loc = String(locale || 'hing').toLowerCase().replace(/_/g, '-');
 
   let fact = '';
-  const pb = String(projectBrief || '').trim();
+  const pb = sanitizeForSpeech(projectBrief || '');
   if (pb) {
-    const chunk = pb.split(/(?<=[.!?])\s+/)[0] || pb.split('\n')[0] || pb;
-    fact = String(chunk).trim().replace(/\s+/g, ' ').slice(0, 130);
+    const sentences = pb.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 10);
+    const chunk = sentences[0] || pb.split('\n').filter(s => s.trim().length > 10)[0] || '';
+    fact = chunk.replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (fact && !fact.endsWith('.') && !fact.endsWith('!') && !fact.endsWith('?')) fact += '.';
   }
 
   if (!pn) {
@@ -731,9 +747,9 @@ async function buildVoiceProjectDiscussionBrief({ orgId: _fallbackOrgId, project
   const pname = String(project.name || '').trim() || 'this project';
   const desc = String(project.description || '').trim().slice(0, 900);
   const industry = project.industry ? String(project.industry).trim() : '';
-  let lines = [`Name: "${pname}"`];
-  if (industry) lines.push(`Category / industry hint: ${industry}`);
-  if (desc) lines.push(`Recorded description:\n${desc}`);
+  let lines = [`Project: ${pname}`];
+  if (industry) lines.push(`Industry: ${industry}`);
+  if (desc) lines.push(`Description: ${desc}`);
 
   const knowledgeRows = await fetchAllProjectKnowledgeRows({ orgId: knowledgeOrgId, projectId });
   if (!knowledgeRows.length) {
@@ -763,9 +779,12 @@ async function buildVoiceProjectDiscussionBrief({ orgId: _fallbackOrgId, project
     if (chunks.length >= 16) break;
   }
 
-  const materialLines = chunks.map((r) => `[${r.source_type}] ${String(r.source_name || 'source')}: ${r.content}`);
+  const materialLines = chunks.map((r) => {
+    const content = String(r.content || '').trim();
+    return content;
+  });
   lines.push('');
-  lines.push('Brain Drive / indexed materials (excerpts):');
+  lines.push('Project knowledge:');
   lines.push(materialLines.join('\n---\n'));
 
   return {
@@ -1114,10 +1133,10 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
 
   const projectDiscussionSticky =
     projectId && (voiceProjectBrief || voiceProjectName)
-      ? `\nSELECTED PROJECT CONTEXT (session — stay focused here):\n${voiceProjectName ? `- Name: "${voiceProjectName}"\n` : ''}${
+      ? `\nPROJECT FACTS (internal reference — NEVER read these labels aloud):\n${voiceProjectName ? `- Listing name: "${voiceProjectName}"\n` : ''}${
           voiceProjectBrief
-            ? `- Baseline snapshot (grounding; summarize in speech — do not dump; do not invent beyond this + KNOWLEDGE BOUNDARY):\n${voiceProjectBrief.slice(0, 6200)}\n`
-            : `- Use the KNOWLEDGE BOUNDARY and transcript to discuss this listing.\n`
+            ? `- Facts for your reference (use naturally in conversation; do NOT dump raw text or read URLs aloud):\n${voiceProjectBrief.slice(0, 6200)}\n`
+            : `- Use the knowledge sections and transcript to discuss this listing.\n`
         }`
       : '';
 
@@ -1128,13 +1147,13 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
 
   const listingLabel = voiceProjectName || (projectId ? `project ${projectId}` : '');
   const projectMandatoryBlock = projectId
-    ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nPRIMARY SUBJECT (NON-NEGOTIABLE)\n- This Tata / SalesPal voice session exists ONLY to sell and qualify interest in: **"${listingLabel}"**.\n- You MUST name this listing explicitly when it helps clarity and keep substance tied to location fit, pricing band, timelines, inventory, amenities, paperwork, visit — for THIS listing only.\n- Do **not** treat this as a generic customer-service call.\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`
+    ? `\n\nPRIMARY SUBJECT (NON-NEGOTIABLE)\n- This voice call exists ONLY to discuss and qualify interest in: "${listingLabel}".\n- You MUST name this listing naturally and keep the conversation about location, pricing, timelines, inventory, amenities, and visits for THIS listing only.\n- Do not treat this as a generic customer-service call.\n\n`
     : '';
 
   const mentionsUrlOrWebsite = utteranceReferencesWebOrListingSite(text);
   const websiteDiscussBlock =
     projectId && mentionsUrlOrWebsite
-      ? `\nWEBSITE / LINK QUESTION:\n- You cannot browse the live web on this call.\n- Treat portal/URL/“website” questions as about **"${listingLabel}"** only: use PROJECT KNOWLEDGE BOUNDARY + SELECTED PROJECT CONTEXT.\n- If those excerpts mention the same hostname or URL, summarise that content in speech; if not, say clearly that this page is not in SalesPal’s indexed materials yet and offer brochure, site visit, or human follow-up.\n- Do not answer with unrelated generic web knowledge when the lead asked about this listing’s site.\n`
+      ? `\nWEBSITE / LINK QUESTION:\n- You cannot browse the live web on this call.\n- If asked about the project website, answer from the project facts you have. Say "I can share the website link with you after this call" or "let me send you the details".\n- Never spell out URLs letter by letter. Just say "the project website" or "our official site".\n`
       : '';
 
   const voiceSystem = `You are on a live phone-style sales call with a lead (SalesPal).
@@ -1163,6 +1182,15 @@ ADDRESSING PROTOCOL (Indian etiquette — “Ji” engine):
 - In casual rapport you may shorten, but defaults should lean courteous on first address each arc.
 
 Sound human: natural spoken wording, short reactions when they fit ("sure", "got it"), varied rhythm — not robotic or like a document. No bullet lists unless listing two clear options.
+
+CRITICAL — SPOKEN OUTPUT ONLY (this text will be read aloud by TTS on a phone call):
+- NEVER output URLs, web addresses, email addresses, or file paths. Instead say "our website" or "the project website" or "I can send you the link".
+- NEVER mention internal system terms: "Brain Drive", "indexed materials", "CRM", "SalesPal", "knowledge boundary", "source_type", "project context", "AI score", "automation". The caller does not know these exist.
+- NEVER output markdown formatting: no asterisks, hashtags, backticks, brackets, or bullet symbols.
+- NEVER spell out technical IDs, UUIDs, or codes.
+- When quoting prices, say them naturally: "forty-five lakhs" not "45,00,000" or "Rs.4500000".
+- When mentioning area, say "two thousand square feet" not "2000 sq.ft."
+- Keep replies conversational and brief — 2 to 4 short spoken sentences max. Imagine you are a real person on a phone, not reading a document.
 
 Rules:
 - Use the full transcript; remember what was already said and stay consistent.

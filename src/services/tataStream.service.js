@@ -283,6 +283,23 @@ function sanitizeTextForTts(text) {
 
 // ─── Core pipeline ──────────────────────────────────────────────────────────
 
+function splitIntoSentences(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  const parts = raw.split(/(?<=[.!?।\n])\s+/);
+  const sentences = [];
+  let current = '';
+  for (const p of parts) {
+    current += (current ? ' ' : '') + p;
+    if (current.length >= 30 || p === parts[parts.length - 1]) {
+      sentences.push(current.trim());
+      current = '';
+    }
+  }
+  if (current.trim()) sentences.push(current.trim());
+  return sentences.filter(Boolean);
+}
+
 async function processUtterance(session) {
   if (session.processing || session.closed) return;
   if (session.totalBufferedBytes < MIN_SPEECH_BYTES) {
@@ -392,7 +409,20 @@ async function processUtterance(session) {
       aiMs,
     });
 
-    await streamTtsToTata(session, reply);
+    const sentences = splitIntoSentences(reply);
+    if (sentences.length <= 1) {
+      await streamTtsToTata(session, reply);
+    } else {
+      logger.info('[tataStream] Streaming sentence-by-sentence TTS', {
+        streamSid: session.streamSid,
+        sentenceCount: sentences.length,
+      });
+      for (const sentence of sentences) {
+        if (session.closed || !session.botSpeaking && session.isSpeaking) break;
+        await streamTtsToTata(session, sentence);
+        if (session.closed) break;
+      }
+    }
 
     const totalMs = Date.now() - pipelineStartMs;
     logger.info('[tataStream] Pipeline complete', {
@@ -400,6 +430,7 @@ async function processUtterance(session) {
       sttMs,
       aiMs,
       totalMs,
+      sentenceCount: sentences.length,
       transcript: transcript.slice(0, 60),
       reply: reply.slice(0, 60),
     });

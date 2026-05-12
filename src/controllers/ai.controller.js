@@ -6,7 +6,7 @@ const aiRuntime = require('../services/aiRuntime.service');
 const sarvamService = require('../services/sarvam.service');
 const env = require('../config/env');
 const { streamVideoUriToResponse } = require('../services/aiVideo.service');
-const { retrieveTopK } = require('../services/projectKnowledge.service');
+const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
@@ -298,13 +298,7 @@ async function chat(req, res, next) {
       }
       if (projectId) {
         const orgId = await getOrgId(req.user.id);
-        const kn = await db.query(
-          `SELECT source_type, source_name, content, embedding
-           FROM project_knowledge
-           WHERE project_id = $1 AND org_id = $2`,
-          [projectId, orgId]
-        );
-        const top = retrieveTopK(String(message || ''), kn.rows, 6);
+        const top = await retrieveTopKSql({ projectId, orgId, queryText: String(message || ''), k: 6 });
         if (top.length) {
           const boundedContext = top.map((r) => `[${r.source_type}] ${r.content}`).join('\n---\n');
           systemPrompt = `${systemPrompt}\n\nProject Knowledge Boundary:\nUse ONLY the context below for factual business claims. If unknown, say so.\n${boundedContext}`;

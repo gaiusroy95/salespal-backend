@@ -5,7 +5,7 @@ const aiService = require('./ai.service');
 const tataVoiceService = require('./tataVoice.service');
 const sarvamService = require('./sarvam.service');
 const { generatePromotionalVideo } = require('./aiVideo.service');
-const { retrieveTopK } = require('./projectKnowledge.service');
+const { retrieveTopK, retrieveTopKSql, embedSingleText } = require('./projectKnowledge.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 
 const videoQueue = [];
@@ -633,6 +633,19 @@ async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, user
   });
   const kbOrgId = access?.knowledgeOrgId;
   if (!kbOrgId || !projectId) return [];
+
+  try {
+    const sqlResults = await retrieveTopKSql({
+      projectId,
+      orgId: kbOrgId,
+      queryText: queryText || 'project overview pricing location',
+      k: 14,
+    });
+    if (sqlResults.length) return sqlResults;
+  } catch (err) {
+    console.warn('[aiRuntime] SQL vector search failed, falling back to in-memory:', err.message);
+  }
+
   const { rows } = await db.query(
     `SELECT source_type, source_name, content, embedding
      FROM project_knowledge

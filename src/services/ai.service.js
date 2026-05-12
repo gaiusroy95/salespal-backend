@@ -484,6 +484,48 @@ async function generateJsonWithPdf(systemPrompt, userTextPrompt, pdfBuffer, opti
   }
 }
 
+async function streamAIWithMessages(chatMessages, systemPrompt, options = {}) {
+  const model = getGeminiModel();
+  if (!model) {
+    throw new Error('Gemini model not available');
+  }
+
+  const maxChars =
+    typeof options.maxCharsPerMessage === 'number' && options.maxCharsPerMessage > 0
+      ? Math.min(options.maxCharsPerMessage, 200000)
+      : 8000;
+
+  const safe = [];
+  for (const m of chatMessages || []) {
+    if (!m || typeof m.content !== 'string') continue;
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const content = m.content.trim().slice(0, maxChars);
+    if (!content) continue;
+    safe.push({ role, content });
+  }
+  if (!safe.length) throw new Error('No chat messages');
+
+  const messages = [{ role: 'system', content: systemPrompt }, ...safe.slice(-40)];
+  const temperature =
+    typeof options.temperature === 'number' && options.temperature >= 0 && options.temperature <= 2
+      ? options.temperature : 0.7;
+  const maxTokensRaw = options.maxTokens ?? 1500;
+  const max_tokens = Math.min(Math.max(Number(maxTokensRaw) || 1500, 1), 16384);
+
+  const transcript = messages
+    .map((m) => `${m.role === 'system' ? 'System' : m.role === 'assistant' ? 'Assistant' : 'User'}:\n${m.content}`)
+    .join('\n\n');
+
+  const result = await model.generateContentStream({
+    contents: [{ role: 'user', parts: [{ text: transcript }] }],
+    generationConfig: {
+      temperature,
+      maxOutputTokens: max_tokens,
+    },
+  });
+  return result.stream;
+}
+
 module.exports = {
   SYSTEM_PROMPT,
   SALES_CONVERSATION_FUNNEL_BLOCK,
@@ -496,6 +538,7 @@ module.exports = {
   buildStrategicInsightsPrompt,
   callAI,
   callAIWithMessages,
+  streamAIWithMessages,
   generateContentJson,
   generateJsonWithPdf,
 };

@@ -4,7 +4,7 @@ const env = require('../config/env');
 const logger = require('../config/logger');
 const whatsappService = require('../services/whatsapp.service');
 const aiService = require('../services/ai.service');
-const { retrieveTopK } = require('../services/projectKnowledge.service');
+const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 
 function headerValue(req, name) {
@@ -196,14 +196,8 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadMetadata, leadCompan
 
   const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
 
-  const { rows: knowledgeRows } = await db.query(
-    `SELECT source_type, source_name, content, embedding
-     FROM project_knowledge
-     WHERE org_id = $1 AND project_id = $2`,
-    [orgId, projectId]
-  );
   const q = String(queryText || '').trim() || `${project.name || 'project'} overview pricing location`;
-  const top = retrieveTopK(q, knowledgeRows, 8);
+  const top = await retrieveTopKSql({ projectId, orgId, queryText: q, k: 8 });
   const evidence = top
     .map((r) => `[${String(r.source_type || 'source')}] ${String(r.content || '').trim()}`)
     .filter(Boolean)

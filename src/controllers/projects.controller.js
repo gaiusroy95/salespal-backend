@@ -8,7 +8,9 @@ const {
   extractDriveLinkKnowledge,
   extractWebpageKnowledge,
   buildKnowledgeRows,
-  retrieveTopK,
+  retrieveTopKSql,
+  vecToSql,
+  reindexProjectEmbeddings,
 } = require('../services/projectKnowledge.service');
 
 function normalizeWebsiteUrl(raw) {
@@ -237,14 +239,25 @@ async function ingestProjectKnowledge(req, res, next) {
 
     let inserted = 0;
     for (const item of extracted) {
-      const rows = buildKnowledgeRows(item);
+      const rows = await buildKnowledgeRows(item);
       for (const r of rows) {
-        await db.query(
-          `INSERT INTO project_knowledge
-           (project_id, org_id, source_type, source_name, content, embedding, metadata, knowledge_version, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-          [projectId, orgId, r.sourceType, r.sourceName, r.content, JSON.stringify(r.embedding), JSON.stringify(r.metadata || {}), nextVersion, req.user.id]
-        );
+        const embJson = JSON.stringify(r.embedding);
+        const vecStr = vecToSql(r.embedding);
+        try {
+          await db.query(
+            `INSERT INTO project_knowledge
+             (project_id, org_id, source_type, source_name, content, embedding, embedding_vec, metadata, knowledge_version, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10)`,
+            [projectId, orgId, r.sourceType, r.sourceName, r.content, embJson, vecStr, JSON.stringify(r.metadata || {}), nextVersion, req.user.id]
+          );
+        } catch (_vecErr) {
+          await db.query(
+            `INSERT INTO project_knowledge
+             (project_id, org_id, source_type, source_name, content, embedding, metadata, knowledge_version, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [projectId, orgId, r.sourceType, r.sourceName, r.content, embJson, JSON.stringify(r.metadata || {}), nextVersion, req.user.id]
+          );
+        }
         inserted += 1;
       }
     }
@@ -293,13 +306,8 @@ async function getProjectKnowledgeContext(req, res, next) {
     const query = String(req.query.q || req.body?.q || '').trim();
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Query q is required' } });
 
-    const { rows } = await db.query(
-      `SELECT source_type, source_name, content, embedding, metadata, knowledge_version, created_at
-       FROM project_knowledge
-       WHERE project_id = $1 AND org_id = $2`,
-      [projectId, orgId]
-    );
-    const top = retrieveTopK(query, rows, Math.min(Math.max(Number(req.query.k || 6), 1), 12));
+    const k = Math.min(Math.max(Number(req.query.k || 6), 1), 12);
+    const top = await retrieveTopKSql({ projectId, orgId, queryText: query, k });
     const contextText = top.map((r) => `[${r.source_type}] ${r.content}`).join('\n---\n');
     return res.json({
       projectId,
@@ -320,6 +328,19 @@ async function getProjectKnowledgeContext(req, res, next) {
   }
 }
 
+async function reindexProjectKnowledge(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    const projectId = req.params.id;
+    const projectRes = await db.query(`SELECT id FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`, [projectId, orgId]);
+    if (!projectRes.rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Project not found' } });
+    const result = await reindexProjectEmbeddings(projectId, orgId);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listProjects,
   getProject,
@@ -330,4 +351,5 @@ module.exports = {
   ingestProjectKnowledge,
   listProjectBrainDrive,
   getProjectKnowledgeContext,
+  reindexProjectKnowledge,
 };

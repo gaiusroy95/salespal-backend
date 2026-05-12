@@ -14,6 +14,7 @@ router.post('/', [body('name').notEmpty().withMessage('Project name is required'
 router.put('/:id', [param('id').isUUID()], validate, ctrl.updateProject);
 router.post('/:id/ingest', [param('id').isUUID()], validate, upload.any(), ctrl.ingestProjectKnowledge);
 router.post('/:id/context', [param('id').isUUID(), body('q').notEmpty().withMessage('q is required')], validate, ctrl.getProjectKnowledgeContext);
+router.post('/:id/reindex-embeddings', [param('id').isUUID()], validate, ctrl.reindexProjectKnowledge);
 router.post('/:id/archive', [param('id').isUUID()], validate, ctrl.archiveProject);
 router.delete('/:id', [param('id').isUUID()], validate, ctrl.deleteProject);
 

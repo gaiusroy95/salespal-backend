@@ -5,7 +5,7 @@ const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
-const { retrieveTopK } = require('../services/projectKnowledge.service');
+const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 
 async function getOrgId(userId) {
   const { rows } = await db.query(
@@ -678,14 +678,8 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, qu
   const projectId = String(project?.id || '').trim();
   if (!projectId) return '';
 
-  const { rows: knowledgeRows } = await db.query(
-    `SELECT source_type, source_name, content, embedding
-     FROM project_knowledge
-     WHERE org_id = $1 AND project_id = $2`,
-    [orgId, projectId]
-  );
   const q = String(queryText || '').trim() || `${project.name || 'project'} overview pricing location`;
-  const top = retrieveTopK(q, knowledgeRows, 8);
+  const top = await retrieveTopKSql({ projectId, orgId, queryText: q, k: 8 });
   const contextLines = top
     .map((r) => `[${String(r.source_type || 'source')}] ${String(r.content || '').trim()}`)
     .filter(Boolean)

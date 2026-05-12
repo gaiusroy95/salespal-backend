@@ -138,10 +138,10 @@ function stripWavHeader(wavBuf) {
 
 // ─── Voice Activity Detection (energy-based) ────────────────────────────────
 
-const SILENCE_THRESHOLD = 150;
-const SILENCE_FRAMES_NEEDED = 20;
-const MAX_BUFFER_SECONDS = 12;
-const MIN_SPEECH_BYTES = 1600;
+const SILENCE_THRESHOLD = 120;
+const SILENCE_FRAMES_NEEDED = 7;   // ~700ms of silence → process (natural pause)
+const MAX_BUFFER_SECONDS = 15;
+const MIN_SPEECH_BYTES = 2400;     // ~300ms of real speech minimum to avoid noise bursts
 
 function computeEnergy(mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return 0;
@@ -227,6 +227,33 @@ function effectiveLocale(session) {
 }
 
 /**
+ * Detect if an STT transcript is likely noise/gibberish rather than real speech.
+ * Common patterns: single repeated syllables, very short fragments with no real words,
+ * garbled text from phone noise.
+ */
+function isGibberishTranscript(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (t.length < 2) return true;
+
+  const words = t.split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) return true;
+
+  if (words.length === 1 && t.length < 4) return true;
+
+  const repeatedGreetings = /^(hello[.!,\s]*){3,}$/i;
+  if (repeatedGreetings.test(t)) return true;
+
+  const onlyFillers = /^[\s,.!?;:'"()…\-–—]+$/;
+  if (onlyFillers.test(t)) return true;
+
+  const uniqueChars = new Set(t.toLowerCase().replace(/[^a-z\u0900-\u0D7F]/g, ''));
+  if (t.length > 8 && uniqueChars.size <= 3) return true;
+
+  return false;
+}
+
+/**
  * Clean text before sending to TTS so the voice sounds natural.
  * Removes URLs, emails, internal labels, code artifacts, and
  * converts abbreviations to spoken form.
@@ -301,6 +328,16 @@ async function processUtterance(session) {
     if (!transcript) {
       logger.info('[tataStream] Empty transcript — skipping AI turn', {
         streamSid: session.streamSid,
+        sttMs,
+      });
+      session.processing = false;
+      return;
+    }
+
+    if (isGibberishTranscript(transcript)) {
+      logger.info('[tataStream] Gibberish/noise transcript — discarding', {
+        streamSid: session.streamSid,
+        transcript: transcript.slice(0, 120),
         sttMs,
       });
       session.processing = false;
@@ -444,7 +481,7 @@ async function streamTtsToTata(session, rawText) {
 
     const CHUNK_SIZE = 3200;
     for (let offset = 0; offset < mulawOut.length; offset += CHUNK_SIZE) {
-      if (session.closed) break;
+      if (session.closed || !session.botSpeaking) break;
       let chunk = mulawOut.subarray(offset, offset + CHUNK_SIZE);
       const remainder = chunk.length % 160;
       if (remainder !== 0) {
@@ -489,9 +526,15 @@ async function streamTtsToTata(session, rawText) {
       ttsMs: Date.now() - ttsStartMs,
     });
 
-    const playbackWaitMs = Math.max(0, Math.round(audioDurationSec * 1000) - 200);
-    await new Promise(r => setTimeout(r, playbackWaitMs));
+    const playbackWaitMs = Math.max(0, Math.round(audioDurationSec * 1000) - 500);
+    const POLL_INTERVAL = 100;
+    let waited = 0;
+    while (waited < playbackWaitMs && session.botSpeaking && !session.closed) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+      waited += POLL_INTERVAL;
+    }
     session.botSpeaking = false;
+    session._bargeInFrames = 0;
   } catch (err) {
     session.botSpeaking = false;
     logger.error('[tataStream] TTS streaming failed', {
@@ -658,17 +701,28 @@ function handleTataConnection(ws, req) {
         session._mediaFrameCount++;
 
         if (session.botSpeaking) {
-          if (session._mediaFrameCount % 200 === 0) {
-            logger.debug('[tataStream] Ignoring media — bot is speaking', {
-              streamSid: session.streamSid,
-              frame: session._mediaFrameCount,
-            });
+          const energy = computeEnergy(Buffer.from(payload, 'base64'));
+          if (energy > SILENCE_THRESHOLD * 1.5) {
+            if (!session._bargeInFrames) session._bargeInFrames = 0;
+            session._bargeInFrames++;
+            if (session._bargeInFrames >= 3) {
+              logger.info('[tataStream] Barge-in detected — stopping bot speech', {
+                streamSid: session.streamSid,
+                energy: Math.round(energy),
+                frame: session._mediaFrameCount,
+              });
+              clearTataAudio(session);
+              session.botSpeaking = false;
+              session._bargeInFrames = 0;
+              session.audioBuffer = [];
+              session.totalBufferedBytes = 0;
+              session.isSpeaking = false;
+              session.silenceFrameCount = 0;
+            }
+          } else {
+            session._bargeInFrames = 0;
           }
-          session.audioBuffer = [];
-          session.totalBufferedBytes = 0;
-          session.isSpeaking = false;
-          session.silenceFrameCount = 0;
-          break;
+          if (session.botSpeaking) break;
         }
 
         const audioBuf = Buffer.from(payload, 'base64');
@@ -709,7 +763,7 @@ function handleTataConnection(ws, req) {
           session.totalBufferedBytes += audioBuf.length;
 
           if (session.silenceFrameCount >= SILENCE_FRAMES_NEEDED) {
-            logger.info('[tataStream] Human stopped speaking (2s silence) — processing', {
+            logger.info('[tataStream] Human paused — processing utterance', {
               streamSid: session.streamSid,
               bufferedBytes: session.totalBufferedBytes,
               durationSec: (session.totalBufferedBytes / 8000).toFixed(1),

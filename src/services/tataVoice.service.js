@@ -387,6 +387,14 @@ async function placeOutboundCall({
   const destinationNumber = normalizeDialNumber(to, { assumeIndianFor10Digit: true });
   const agentNumber = normalizeDialNumber(env.telephony.fromNumber, { assumeIndianFor10Digit: false });
   const callerId = normalizeDialNumber(env.telephony.fromNumber, { assumeIndianFor10Digit: false });
+  logger.info('[telephony] placeOutboundCall request', {
+    conversationId,
+    destination_len: destinationNumber.length,
+    destination_tail: destinationNumber.length >= 4 ? destinationNumber.slice(-4) : '',
+    apiStyle: resolvedApiStyle,
+    orgId,
+    userId,
+  });
   const openerTrimmed = String(opener || '').trim().slice(0, OPENER_PAYLOAD_MAX_LEN);
   const pn = projectName ? String(projectName).trim().slice(0, 240) : '';
   const pid = projectId ? String(projectId).trim().slice(0, 120) : '';

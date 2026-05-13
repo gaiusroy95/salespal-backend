@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const crypto = require('crypto');
 const env = require('../config/env');
+const logger = require('../config/logger');
 const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
@@ -1289,6 +1290,20 @@ async function dispatchDueAutomationJobs(req, res, next) {
           continue;
         }
         try {
+          const { rows: phoneRows } = await db.query(
+            `SELECT contact_phone FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`,
+            [job.lead_id, orgId]
+          );
+          const dialPhone =
+            phoneRows[0]?.contact_phone != null ? String(phoneRows[0].contact_phone) : String(job.contact_phone || '');
+          if (!hasDialableLeadPhone(dialPhone)) {
+            const err = new Error(
+              'Lead has no valid contact_phone on file; cannot place Tata outbound call. Re-save the campaign start (or edit the lead phone) so the queue picks up the list number, then try again.'
+            );
+            err.code = 'MISSING_DIAL_PHONE';
+            throw err;
+          }
+
           const { mirror: autoLangMirror, aiLang: fixedAiLang } = await getUserSalesAutomationLanguageSettings(
             req.user.id
           );
@@ -1303,10 +1318,18 @@ async function dispatchDueAutomationJobs(req, res, next) {
             .filter(Boolean)
             .join('\n\n');
 
+          logger.info('[automation-dispatch] placing Tata voice session', {
+            automationJobId: job.id,
+            leadId: job.lead_id,
+            payloadKind: payloadObj.kind || null,
+            telephonyEnabled: tataVoiceService.isTelephonyEnabled(),
+            phoneDigitsLen: digitsOnlyPhone(dialPhone).length,
+          });
+
           const { session, telephony } = await aiRuntime.createVoiceSession({
             brandId: `web-${req.user.id}`,
             leadId: job.lead_id,
-            phone: job.contact_phone,
+            phone: dialPhone,
             name: leadName,
             locale: sessionLocale,
             mode: 'automation',
@@ -1318,6 +1341,16 @@ async function dispatchDueAutomationJobs(req, res, next) {
             mirrorSpokenLanguage: autoLangMirror,
             openerTtsLocale: autoLangMirror ? openerLocale : null,
           });
+
+          if (tataVoiceService.isTelephonyEnabled() && !telephony?.accepted) {
+            const err = new Error(
+              telephony?.reason ||
+                'Tata did not accept the outbound call. Check TATA_* env vars, caller ID, and Smartflo Voice Bot routing.'
+            );
+            err.code = 'TATA_CALL_NOT_ACCEPTED';
+            err.details = telephony;
+            throw err;
+          }
 
           await db.query(
             `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
@@ -1944,6 +1977,12 @@ function digitsOnlyPhone(phone) {
   return String(phone || '').replace(/\D/g, '');
 }
 
+/** Minimum digits so Tata normalizeDialNumber can build a destination (e.g. 91 + 10). */
+function hasDialableLeadPhone(phone) {
+  const d = digitsOnlyPhone(phone);
+  return d.length >= 10;
+}
+
 /**
  * Resolve or create a `leads` row for a campaign_lead so sales_automation_jobs (FK → leads) can dial them.
  */
@@ -1955,63 +1994,84 @@ async function ensureSalesLeadForCampaignLead({
   projectId,
   campaignLead,
 }) {
+  const raw = digitsOnlyPhone(campaignLead.phone);
+  if (!raw || raw.length < 7) return null;
+  const tail10 = raw.slice(-10);
+  const fullName = String(campaignLead.name || 'Campaign lead').trim();
+  const parts = fullName.split(/\s+/).filter(Boolean);
+  const firstName = parts[0] || 'Lead';
+  const lastName = parts.slice(1).join(' ') || '';
+
+  let leadId;
+
   if (campaignLead.deal_id) {
     const { rows } = await db.query(`SELECT id FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [
       campaignLead.deal_id,
       orgId,
     ]);
-    if (rows[0]) return rows[0].id;
-  }
-  const raw = digitsOnlyPhone(campaignLead.phone);
-  if (!raw || raw.length < 7) return null;
-  const tail10 = raw.slice(-10);
-  const { rows: existing } = await db.query(
-    `SELECT id FROM leads
-     WHERE org_id = $1
-       AND RIGHT(regexp_replace(COALESCE(contact_phone, ''), '\\D', '', 'g'), 10) = $2
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [orgId, tail10]
-  );
-  if (existing[0]) {
-    await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [
-      existing[0].id,
-      campaignLead.id,
-    ]);
-    return existing[0].id;
+    if (rows[0]) leadId = rows[0].id;
   }
 
-  const fullName = String(campaignLead.name || 'Campaign lead').trim();
-  const parts = fullName.split(/\s+/).filter(Boolean);
-  const firstName = parts[0] || 'Lead';
-  const lastName = parts.slice(1).join(' ') || '';
-  const meta = {
-    campaignId,
-    campaignName: campaignName || null,
-    projectId: projectId || null,
-    preferredLocale: 'hing',
-    source: 'campaign_upload',
-  };
-  const { rows: inserted } = await db.query(
-    `INSERT INTO leads
-       (org_id, user_id, contact_first_name, contact_last_name, contact_email, contact_phone,
-        company_name, stage, priority, value, source, metadata)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'new','medium',0,$8,$9::jsonb)
-     RETURNING id`,
-    [
-      orgId,
-      userId,
-      firstName,
-      lastName || null,
-      campaignLead.email || null,
-      raw,
-      null,
-      `Campaign: ${(campaignName || '').slice(0, 80)}`,
-      JSON.stringify(meta),
-    ]
+  if (!leadId) {
+    const { rows: existing } = await db.query(
+      `SELECT id FROM leads
+       WHERE org_id = $1
+         AND RIGHT(regexp_replace(COALESCE(contact_phone, ''), '\\D', '', 'g'), 10) = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [orgId, tail10]
+    );
+    if (existing[0]) {
+      leadId = existing[0].id;
+      await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [
+        leadId,
+        campaignLead.id,
+      ]);
+    }
+  }
+
+  if (!leadId) {
+    const meta = {
+      campaignId,
+      campaignName: campaignName || null,
+      projectId: projectId || null,
+      preferredLocale: 'hing',
+      source: 'campaign_upload',
+    };
+    const { rows: inserted } = await db.query(
+      `INSERT INTO leads
+         (org_id, user_id, contact_first_name, contact_last_name, contact_email, contact_phone,
+          company_name, stage, priority, value, source, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'new','medium',0,$8,$9::jsonb)
+       RETURNING id`,
+      [
+        orgId,
+        userId,
+        firstName,
+        lastName || null,
+        campaignLead.email || null,
+        raw,
+        null,
+        `Campaign: ${(campaignName || '').slice(0, 80)}`,
+        JSON.stringify(meta),
+      ]
+    );
+    leadId = inserted[0].id;
+    await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [leadId, campaignLead.id]);
+    return leadId;
+  }
+
+  // deal_id or phone-dedupe match: always sync dial digits from the campaign row so automation
+  // uses the same number as the list (CRM rows may have empty or stale contact_phone).
+  await db.query(
+    `UPDATE leads
+       SET contact_phone = $2,
+           contact_first_name = COALESCE(NULLIF(TRIM($3::text), ''), contact_first_name),
+           contact_last_name = COALESCE(NULLIF(TRIM($4::text), ''), contact_last_name),
+           updated_at = NOW()
+     WHERE id = $1 AND org_id = $5`,
+    [leadId, raw, firstName, lastName || null, orgId]
   );
-  const leadId = inserted[0].id;
-  await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [leadId, campaignLead.id]);
   return leadId;
 }
 

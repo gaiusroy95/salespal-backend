@@ -5,6 +5,7 @@ const aiRuntime = require('../services/aiRuntime.service');
 const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
+const tataVoiceService = require('../services/tataVoice.service');
 const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 
 async function getOrgId(userId) {
@@ -1912,6 +1913,271 @@ function parseTimeWindowValue(v) {
   return `${String(m[1]).padStart(2, '0')}:${m[2]}`;
 }
 
+function digitsOnlyPhone(phone) {
+  return String(phone || '').replace(/\D/g, '');
+}
+
+/**
+ * Resolve or create a `leads` row for a campaign_lead so sales_automation_jobs (FK → leads) can dial them.
+ */
+async function ensureSalesLeadForCampaignLead({
+  orgId,
+  userId,
+  campaignId,
+  campaignName,
+  projectId,
+  campaignLead,
+}) {
+  if (campaignLead.deal_id) {
+    const { rows } = await db.query(`SELECT id FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [
+      campaignLead.deal_id,
+      orgId,
+    ]);
+    if (rows[0]) return rows[0].id;
+  }
+  const raw = digitsOnlyPhone(campaignLead.phone);
+  if (!raw || raw.length < 7) return null;
+  const tail10 = raw.slice(-10);
+  const { rows: existing } = await db.query(
+    `SELECT id FROM leads
+     WHERE org_id = $1
+       AND RIGHT(regexp_replace(COALESCE(contact_phone, ''), '\\D', '', 'g'), 10) = $2
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [orgId, tail10]
+  );
+  if (existing[0]) {
+    await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [
+      existing[0].id,
+      campaignLead.id,
+    ]);
+    return existing[0].id;
+  }
+
+  const fullName = String(campaignLead.name || 'Campaign lead').trim();
+  const parts = fullName.split(/\s+/).filter(Boolean);
+  const firstName = parts[0] || 'Lead';
+  const lastName = parts.slice(1).join(' ') || '';
+  const meta = {
+    campaignId,
+    campaignName: campaignName || null,
+    projectId: projectId || null,
+    preferredLocale: 'hing',
+    source: 'campaign_upload',
+  };
+  const { rows: inserted } = await db.query(
+    `INSERT INTO leads
+       (org_id, user_id, contact_first_name, contact_last_name, contact_email, contact_phone,
+        company_name, stage, priority, value, source, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'new','medium',0,$8,$9::jsonb)
+     RETURNING id`,
+    [
+      orgId,
+      userId,
+      firstName,
+      lastName || null,
+      campaignLead.email || null,
+      raw,
+      null,
+      `Campaign: ${(campaignName || '').slice(0, 80)}`,
+      JSON.stringify(meta),
+    ]
+  );
+  const leadId = inserted[0].id;
+  await db.query(`UPDATE campaign_leads SET deal_id = $1, updated_at = NOW() WHERE id = $2`, [leadId, campaignLead.id]);
+  return leadId;
+}
+
+/**
+ * Queue staggered outbound bot calls for every campaign lead with a phone.
+ * The background dispatcher (server.js) picks up sales_automation_jobs and calls createVoiceSession one-by-one.
+ */
+async function enqueueCampaignCallQueue(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    }
+    if (!tataVoiceService.isTelephonyEnabled()) {
+      return res.status(400).json({
+        error: {
+          code: 'TELEPHONY_DISABLED',
+          message: 'Tata Smartflo telephony is not configured. Set Tata env vars and enable outbound in settings.',
+        },
+      });
+    }
+
+    const campaignId = req.params.campaignId;
+    const replacePending = req.body?.replacePending !== false;
+    const gapSeconds = Math.max(45, Math.min(900, parseInt(String(req.body?.gapSeconds || '120'), 10) || 120));
+
+    const { rows: campRows } = await db.query(
+      `SELECT id, name, project_id, metadata FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [campaignId, orgId]
+    );
+    const campaign = campRows[0];
+    if (!campaign) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+    }
+
+    const md = campaign.metadata && typeof campaign.metadata === 'object' ? campaign.metadata : {};
+    if (!md.calling_enabled) {
+      return res.status(400).json({
+        error: {
+          code: 'CALLING_NOT_ENABLED',
+          message: 'Enable AI calling and save communication setup before queueing calls.',
+        },
+      });
+    }
+    const script = String(md.calling_script || '').trim();
+    if (!script) {
+      return res.status(400).json({
+        error: {
+          code: 'CALLING_SCRIPT_REQUIRED',
+          message: 'Add a calling script (or generate one) before queueing outbound calls.',
+        },
+      });
+    }
+
+    const projectId = campaign.project_id || md.project_id || null;
+    const agentName =
+      String(md.agent_custom_name || md.agent_male_name || md.agent_female_name || '').trim() || 'SalesPal AI';
+
+    if (replacePending) {
+      await db.query(
+        `UPDATE sales_automation_jobs
+         SET status = 'cancelled', updated_at = NOW()
+         WHERE org_id = $1
+           AND user_id = $2
+           AND status = 'pending'
+           AND payload->>'kind' = 'campaign_outbound'
+           AND payload->>'campaignId' = $3`,
+        [orgId, req.user.id, campaignId]
+      );
+    }
+
+    const { rows: cLeads } = await db.query(
+      `SELECT id, name, phone, email, deal_id, created_at
+       FROM campaign_leads
+       WHERE campaign_id = $1 AND org_id = $2
+       ORDER BY created_at ASC`,
+      [campaignId, orgId]
+    );
+
+    const callWindow = await getUserSalesCallWindow(req.user.id);
+    let queued = 0;
+    let skippedNoPhone = 0;
+    let skippedInvalid = 0;
+    let skippedDup = 0;
+    const errors = [];
+
+    let slotCursor = Date.now();
+
+    for (let i = 0; i < cLeads.length; i += 1) {
+      const cl = cLeads[i];
+      const rawPhone = digitsOnlyPhone(cl.phone);
+      if (!cl.phone || !rawPhone) {
+        skippedNoPhone += 1;
+        continue;
+      }
+      if (!isValidPhone(cl.phone)) {
+        skippedInvalid += 1;
+        continue;
+      }
+
+      let leadId;
+      try {
+        leadId = await ensureSalesLeadForCampaignLead({
+          orgId,
+          userId: req.user.id,
+          campaignId,
+          campaignName: campaign.name,
+          projectId,
+          campaignLead: cl,
+        });
+      } catch (e) {
+        errors.push({ campaignLeadId: cl.id, error: e.message || 'lead_create_failed' });
+        continue;
+      }
+      if (!leadId) {
+        skippedInvalid += 1;
+        continue;
+      }
+
+      await db.query(
+        `UPDATE leads
+         SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [
+          leadId,
+          JSON.stringify({
+            projectId: projectId || null,
+            agentName,
+            campaign: String(campaign.name || '').trim() || null,
+          }),
+        ]
+      );
+
+      let scheduleAt = new Date(slotCursor).toISOString();
+      const leadTimezone = 'Asia/Kolkata';
+      if (!isWithinCallWindow(scheduleAt, leadTimezone, callWindow)) {
+        scheduleAt = nextAvailableCallIso(scheduleAt, leadTimezone, callWindow);
+        slotCursor = new Date(scheduleAt).getTime();
+      }
+
+      const fingerprint = buildAutomationFingerprint({
+        sourceChannel: 'call',
+        targetChannel: 'call',
+        scheduleAt,
+        text: `campaign_outbound:${campaignId}:${cl.id}:${i}:${scheduleAt}`,
+      });
+
+      const payload = {
+        kind: 'campaign_outbound',
+        campaignId,
+        campaignLeadId: cl.id,
+        messageTemplate: script,
+      };
+
+      const ins = await db
+        .query(
+          `INSERT INTO sales_automation_jobs (org_id, user_id, lead_id, source_channel, target_channel, schedule_at, payload, fingerprint)
+           VALUES ($1,$2,$3,'call','call',$4,$5::jsonb,$6)
+           RETURNING id`,
+          [orgId, req.user.id, leadId, scheduleAt, JSON.stringify(payload), fingerprint]
+        )
+        .catch((err) => {
+          if (String(err?.message || '').includes('ux_sales_automation_jobs_pending_fingerprint')) {
+            return { rows: [] };
+          }
+          throw err;
+        });
+
+      if (!ins.rows[0]) {
+        skippedDup += 1;
+      } else {
+        queued += 1;
+        slotCursor += gapSeconds * 1000;
+      }
+    }
+
+    return res.json({
+      ok: true,
+      campaignId,
+      gapSeconds,
+      totalCampaignLeads: cLeads.length,
+      queued,
+      skippedNoPhone,
+      skippedInvalid,
+      skippedDup,
+      errors: errors.length ? errors : undefined,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function saveCampaignCommunicationSetup(req, res, next) {
   try {
     const orgId = await getOrgId(req.user.id);
@@ -2031,6 +2297,7 @@ module.exports = {
   createSalesCampaign,
   saveCampaignWebsite,
   saveCampaignCommunicationSetup,
+  enqueueCampaignCallQueue,
   listCampaignGoalSamples,
   listCampaignLeads,
   addCampaignLead,

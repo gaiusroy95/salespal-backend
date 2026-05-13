@@ -17,6 +17,16 @@ router.post('/campaigns/:campaignId/website', [
 router.post('/campaigns/:campaignId/communication-setup', [
   param('campaignId').isUUID(),
 ], validate, ctrl.saveCampaignCommunicationSetup);
+router.post(
+  '/campaigns/:campaignId/enqueue-call-queue',
+  [
+    param('campaignId').isUUID(),
+    body('gapSeconds').optional().isInt({ min: 45, max: 900 }),
+    body('replacePending').optional().isBoolean(),
+  ],
+  validate,
+  ctrl.enqueueCampaignCallQueue
+);
 router.get('/campaign-goal-samples', ctrl.listCampaignGoalSamples);
 router.get('/campaigns/:campaignId/leads', [param('campaignId').isUUID()], validate, ctrl.listCampaignLeads);
 router.post('/campaigns/:campaignId/leads', [

@@ -306,13 +306,13 @@ async function createSalesCampaign(req, res, next) {
 async function listCampaignLeads(req, res, next) {
   try {
     const orgId = await getOrgId(req.user.id);
-    if (!orgId) return res.json([]);
+    if (!orgId) return res.json({ leads: [] });
 
     const { rows } = await db.query(
       `SELECT * FROM campaign_leads WHERE org_id = $1 AND campaign_id = $2 ORDER BY created_at DESC`,
       [orgId, req.params.campaignId]
     );
-    res.json(rows);
+    res.json({ leads: rows });
   } catch (err) {
     next(err);
   }
@@ -2009,7 +2009,6 @@ async function enqueueCampaignCallQueue(req, res, next) {
 
     const campaignId = req.params.campaignId;
     const replacePending = req.body?.replacePending !== false;
-    const gapSeconds = Math.max(45, Math.min(900, parseInt(String(req.body?.gapSeconds || '120'), 10) || 120));
 
     const { rows: campRows } = await db.query(
       `SELECT id, name, project_id, metadata FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
@@ -2021,6 +2020,19 @@ async function enqueueCampaignCallQueue(req, res, next) {
     }
 
     const md = campaign.metadata && typeof campaign.metadata === 'object' ? campaign.metadata : {};
+    const gapFromBody = req.body?.gapSeconds ?? req.body?.gap_seconds;
+    const gapParsed = parseInt(String(gapFromBody ?? ''), 10);
+    const gapFromMd = parseInt(String(md.outbound_call_gap_seconds ?? ''), 10);
+    const gapSeconds = Math.max(
+      45,
+      Math.min(
+        900,
+        (Number.isFinite(gapParsed) && gapParsed > 0 ? gapParsed : null) ||
+          (Number.isFinite(gapFromMd) && gapFromMd > 0 ? gapFromMd : null) ||
+          120
+      )
+    );
+
     if (!md.calling_enabled) {
       return res.status(400).json({
         error: {
@@ -2178,6 +2190,41 @@ async function enqueueCampaignCallQueue(req, res, next) {
   }
 }
 
+/** Cancel pending staggered outbound jobs for this campaign (e.g. when campaign is paused). */
+async function cancelCampaignCallQueue(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    }
+    const campaignId = req.params.campaignId;
+    const { rows: campRows } = await db.query(`SELECT id FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`, [
+      campaignId,
+      orgId,
+    ]);
+    if (!campRows[0]) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+    }
+    const result = await db.query(
+      `UPDATE sales_automation_jobs
+       SET status = 'cancelled', updated_at = NOW()
+       WHERE org_id = $1
+         AND user_id = $2
+         AND status = 'pending'
+         AND payload->>'kind' = 'campaign_outbound'
+         AND payload->>'campaignId' = $3`,
+      [orgId, req.user.id, campaignId]
+    );
+    return res.json({
+      ok: true,
+      campaignId,
+      cancelled: result.rowCount ?? 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function saveCampaignCommunicationSetup(req, res, next) {
   try {
     const orgId = await getOrgId(req.user.id);
@@ -2270,6 +2317,13 @@ async function saveCampaignCommunicationSetup(req, res, next) {
       pre_script_required: true,
       script_compliance_status: complianceStatus,
       communication_setup_updated_at: new Date().toISOString(),
+      outbound_call_gap_seconds: Math.max(
+        45,
+        Math.min(
+          900,
+          parseInt(String(body.outboundCallGapSeconds ?? body.outbound_call_gap_seconds ?? '120'), 10) || 120
+        )
+      ),
     };
 
     const { rows: updatedRows } = await db.query(
@@ -2298,6 +2352,7 @@ module.exports = {
   saveCampaignWebsite,
   saveCampaignCommunicationSetup,
   enqueueCampaignCallQueue,
+  cancelCampaignCallQueue,
   listCampaignGoalSamples,
   listCampaignLeads,
   addCampaignLead,

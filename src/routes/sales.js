@@ -27,6 +27,12 @@ router.post(
   validate,
   ctrl.enqueueCampaignCallQueue
 );
+router.post(
+  '/campaigns/:campaignId/cancel-call-queue',
+  [param('campaignId').isUUID()],
+  validate,
+  ctrl.cancelCampaignCallQueue
+);
 router.get('/campaign-goal-samples', ctrl.listCampaignGoalSamples);
 router.get('/campaigns/:campaignId/leads', [param('campaignId').isUUID()], validate, ctrl.listCampaignLeads);
 router.post('/campaigns/:campaignId/leads', [

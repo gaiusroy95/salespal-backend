@@ -67,8 +67,28 @@ async function createInboundVoiceSession(callerPhone) {
   }
 
   const agentName = 'SalesPal AI';
-  const openerText = projectName
-    ? `Hello! Thank you for calling. I am ${agentName}, and I would be happy to help you with ${projectName}. How can I assist you today?`
+
+  let voiceProjectBrief = '';
+  let voiceProjectHasKnowledge = false;
+  let voiceProjectNameMeta = projectName || null;
+  if (projectId && orgId && userId) {
+    try {
+      const vp = await aiRuntime.buildVoiceProjectDiscussionBrief({
+        orgId,
+        projectId,
+        leadId: null,
+        userId,
+      });
+      voiceProjectBrief = String(vp.brief || '').trim();
+      voiceProjectHasKnowledge = Boolean(vp.hasKnowledge);
+      if (vp.displayName) voiceProjectNameMeta = vp.displayName;
+    } catch (e) {
+      logger.warn('[tataStream] Inbound Brain Drive brief build failed', { error: e.message });
+    }
+  }
+
+  const openerText = voiceProjectNameMeta
+    ? `Hello! Thank you for calling. I am ${agentName}, and I would be happy to help you with ${voiceProjectNameMeta}. How can I assist you today?`
     : `Hello! Thank you for calling. I am ${agentName}. How can I help you today?`;
 
   let created = false;
@@ -77,7 +97,9 @@ async function createInboundVoiceSession(callerPhone) {
       projectId: projectId || null,
       agentName,
       voiceStylePersona: 'friendly_consultant',
-      voiceProjectName: projectName || null,
+      voiceProjectName: voiceProjectNameMeta || null,
+      voiceProjectBrief,
+      voiceProjectHasKnowledge,
       humanTakeoverActive: false,
       voiceGender: 'unknown',
       inboundAutoCreated: true,
@@ -103,7 +125,8 @@ async function createInboundVoiceSession(callerPhone) {
       orgId,
       userId,
       projectId,
-      projectName,
+      projectName: voiceProjectNameMeta || projectName,
+      brainBriefChars: voiceProjectBrief.length,
       callerPhone: callerPhone?.slice(-4),
       openerLen: openerText.length,
     });
@@ -138,7 +161,7 @@ async function createInboundVoiceSession(callerPhone) {
     locale,
     mirrorSpokenLanguage: true,
     openerTtsLocale: 'hing',
-    projectName: projectName || '',
+    projectName: voiceProjectNameMeta || projectName || '',
     projectId: projectId || '',
     openerText,
     leadName: 'Inbound Caller',
@@ -860,9 +883,13 @@ function handleTataConnection(ws, req) {
           }
         }
 
-        if (meta.conversationId && !meta.openerText) {
-          logger.info('[tataStream] Have conversationId but no opener — loading from DB', {
-            streamSid, conversationId: meta.conversationId,
+        if (
+          meta.conversationId &&
+          (!meta.orgId || !meta.userId || !meta.projectId || !meta.openerText)
+        ) {
+          logger.info('[tataStream] Enriching session meta from DB (missing org/user/project/opener)', {
+            streamSid,
+            conversationId: meta.conversationId,
           });
           const dbCtx = await loadSessionContext(meta.conversationId);
           if (dbCtx) {
@@ -879,6 +906,8 @@ function handleTataConnection(ws, req) {
               hasOpener: Boolean(meta.openerText),
               openerLen: meta.openerText?.length || 0,
               projectName: meta.projectName || '(none)',
+              hasOrg: Boolean(meta.orgId),
+              hasUser: Boolean(meta.userId),
             });
           }
         }

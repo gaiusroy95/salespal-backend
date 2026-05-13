@@ -1030,7 +1030,9 @@ async function createVoiceSession({
 
 async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLocale }) {
   const row = await loadVoiceSession(conversationId);
-  assertVoiceSessionAccess(row, { orgId, userId });
+  const accessOrgId = orgId || row?.org_id || null;
+  const accessUserId = userId || row?.user_id || null;
+  assertVoiceSessionAccess(row, { orgId: accessOrgId, userId: accessUserId });
   const mdEarly = row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
   if (Boolean(mdEarly.humanTakeoverActive)) {
     const sessionRow = await loadVoiceSession(conversationId);
@@ -1078,14 +1080,16 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
   const hydrateFailed = Boolean(md.voiceProjectHydrateFailed);
   const thinVoiceBrain =
     !String(voiceProjectName || '').trim() || !String(voiceProjectBrief || '').trim();
+  /** PSTN often omits userId in WS meta; inbound has no lead_id — still hydrate from project Brain Drive. */
+  const hydrateUserId = userId || row.user_id;
 
-  if (projectId && row.lead_id && userId && !hydrateFailed && thinVoiceBrain) {
+  if (projectId && hydrateUserId && !hydrateFailed && thinVoiceBrain) {
     try {
       const vp = await buildVoiceProjectDiscussionBrief({
         orgId: effectiveOrgForProject,
         projectId,
-        leadId: row.lead_id,
-        userId,
+        leadId: row.lead_id || null,
+        userId: hydrateUserId,
       });
       if (vp.displayName || vp.brief) {
         voiceProjectBrief = String(vp.brief || '').trim();
@@ -1098,13 +1102,13 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
             voiceProjectHasKnowledge: Boolean(vp.hasKnowledge),
             voiceProjectHydrateFailed: false,
           },
-          { orgId, userId }
+          { orgId: accessOrgId, userId: accessUserId }
         );
       } else {
         await mergeVoiceSessionMetadata(
           conversationId,
           { voiceProjectHydrateFailed: true },
-          { orgId, userId }
+          { orgId: accessOrgId, userId: accessUserId }
         );
       }
     } catch (e) {
@@ -1112,7 +1116,7 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
       await mergeVoiceSessionMetadata(
         conversationId,
         { voiceProjectHydrateFailed: true },
-        { orgId, userId }
+        { orgId: accessOrgId, userId: accessUserId }
       ).catch(() => {});
     }
   }
@@ -1507,6 +1511,8 @@ async function getVideoJob(jobId, { orgId } = {}) {
 module.exports = {
   createVoiceSession,
   handleVoiceTurn,
+  /** Pre-seed PSTN / inbound sessions with Brain Drive baseline (project + indexed chunks). */
+  buildVoiceProjectDiscussionBrief,
   mergeVoiceSessionMetadata,
   getVoiceTranscriptBrief,
   getVoiceHistory,

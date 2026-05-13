@@ -323,6 +323,14 @@ async function addCampaignLead(req, res, next) {
     const orgId = await getOrgId(req.user.id);
     if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
 
+    const { rows: campRows } = await db.query(
+      `SELECT id FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [req.params.campaignId, orgId]
+    );
+    if (!campRows[0]) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+    }
+
     const { name, phone, email } = req.body;
 
     const { rows } = await db.query(
@@ -2008,7 +2016,12 @@ async function enqueueCampaignCallQueue(req, res, next) {
     }
 
     const campaignId = req.params.campaignId;
-    const replacePending = req.body?.replacePending !== false;
+    const rawRp = req.body?.replacePending ?? req.body?.replace_pending;
+    let replacePending = true;
+    if (rawRp === false || rawRp === 0) replacePending = false;
+    else if (typeof rawRp === 'string' && ['false', '0', 'no'].includes(rawRp.trim().toLowerCase())) {
+      replacePending = false;
+    }
 
     const { rows: campRows } = await db.query(
       `SELECT id, name, project_id, metadata FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
@@ -2019,7 +2032,18 @@ async function enqueueCampaignCallQueue(req, res, next) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
     }
 
-    const md = campaign.metadata && typeof campaign.metadata === 'object' ? campaign.metadata : {};
+    let md = {};
+    const rawMd = campaign.metadata;
+    if (rawMd && typeof rawMd === 'object' && !Array.isArray(rawMd)) {
+      md = rawMd;
+    } else if (typeof rawMd === 'string') {
+      try {
+        const p = JSON.parse(rawMd);
+        if (p && typeof p === 'object' && !Array.isArray(p)) md = p;
+      } catch (_) {
+        md = {};
+      }
+    }
     const gapFromBody = req.body?.gapSeconds ?? req.body?.gap_seconds;
     const gapParsed = parseInt(String(gapFromBody ?? ''), 10);
     const gapFromMd = parseInt(String(md.outbound_call_gap_seconds ?? ''), 10);
@@ -2283,7 +2307,18 @@ async function saveCampaignCommunicationSetup(req, res, next) {
       return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Outbound window must be HH:MM format' } });
     }
 
-    const baseMd = campaign.metadata && typeof campaign.metadata === 'object' ? campaign.metadata : {};
+    const rawMd = campaign.metadata;
+    let baseMd = {};
+    if (rawMd && typeof rawMd === 'object' && !Array.isArray(rawMd)) {
+      baseMd = rawMd;
+    } else if (typeof rawMd === 'string') {
+      try {
+        const parsed = JSON.parse(rawMd);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) baseMd = parsed;
+      } catch (_) {
+        baseMd = {};
+      }
+    }
     const nextMd = {
       ...baseMd,
       calling_enabled: Boolean(body.callingEnabled ?? body.calling_enabled),

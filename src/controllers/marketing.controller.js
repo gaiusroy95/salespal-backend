@@ -132,17 +132,24 @@ async function updateCampaign(req, res, next) {
     const fields = ['name', 'platform', 'objective', 'status', 'daily_budget', 'total_budget', 'start_date', 'end_date', 'project_id', 'impressions', 'clicks', 'conversions', 'spend', 'revenue', 'reach', 'ad_platforms', 'ad_format', 'headline', 'primary_text', 'cta', 'media_type', 'media_url', 'budget_platforms', 'budget_split', 'currency', 'metadata'];
     const camelToSnake = { dailyBudget: 'daily_budget', totalBudget: 'total_budget', startDate: 'start_date', endDate: 'end_date', projectId: 'project_id', adPlatforms: 'ad_platforms', adFormat: 'ad_format', primaryText: 'primary_text', mediaType: 'media_type', mediaUrl: 'media_url', budgetPlatforms: 'budget_platforms', budgetSplit: 'budget_split' };
 
+    const rawBody = req.body;
+    const body =
+      rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody) && !Buffer.isBuffer(rawBody)
+        ? rawBody
+        : {};
+
     const updates = [];
     const values = [];
     let idx = 1;
 
-    for (const [key, value] of Object.entries(req.body)) {
+    for (const [key, value] of Object.entries(body)) {
       const dbField = camelToSnake[key] || key;
-      if (fields.includes(dbField) && value !== undefined) {
-        const val = (dbField === 'budget_split' || dbField === 'metadata') ? JSON.stringify(value) : value;
-        updates.push(`${dbField} = $${idx++}`);
-        values.push(val);
-      }
+      if (!fields.includes(dbField) || value === undefined) continue;
+      // Avoid writing NULL into NOT NULL / constrained columns when clients send null explicitly.
+      if (dbField === 'status' && (value === null || String(value).trim() === '')) continue;
+      const val = (dbField === 'budget_split' || dbField === 'metadata') ? JSON.stringify(value) : value;
+      updates.push(`${dbField} = $${idx++}`);
+      values.push(val);
     }
 
     if (updates.length === 0) {

@@ -22,7 +22,6 @@ router.post(
   [
     param('campaignId').isUUID(),
     body('gapSeconds').optional().isInt({ min: 45, max: 900 }),
-    body('replacePending').optional().isBoolean(),
   ],
   validate,
   ctrl.enqueueCampaignCallQueue

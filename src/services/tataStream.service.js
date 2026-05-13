@@ -71,6 +71,7 @@ async function createInboundVoiceSession(callerPhone) {
     ? `Hello! Thank you for calling. I am ${agentName}, and I would be happy to help you with ${projectName}. How can I assist you today?`
     : `Hello! Thank you for calling. I am ${agentName}. How can I help you today?`;
 
+  let created = false;
   try {
     const metadata = {
       projectId: projectId || null,
@@ -96,6 +97,7 @@ async function createInboundVoiceSession(callerPhone) {
       [conversationId, openerText]
     );
 
+    created = true;
     logger.info('[tataStream] Created inbound voice session OK', {
       conversationId,
       orgId,
@@ -112,6 +114,21 @@ async function createInboundVoiceSession(callerPhone) {
       conversationId,
       orgId,
     });
+  }
+
+  if (!created) {
+    return {
+      conversationId: '',
+      orgId: null,
+      userId: null,
+      locale: 'hing',
+      mirrorSpokenLanguage: true,
+      openerTtsLocale: 'hing',
+      projectName: '',
+      projectId: '',
+      openerText: '',
+      leadName: 'Inbound Caller',
+    };
   }
 
   return {
@@ -246,7 +263,9 @@ function stripWavHeader(wavBuf) {
 const SILENCE_THRESHOLD = 110;
 const SILENCE_FRAMES_NEEDED = 5;   // ~500ms silence → end utterance (snappier turn-taking)
 const MAX_BUFFER_SECONDS = 12;
-const MIN_SPEECH_BYTES = 1920;     // ~240ms speech — catch short “yes / hello” without noise-only triggers
+const MIN_SPEECH_BYTES = 1280;     // ~160ms speech — short “hello / haan” after PSTN latency
+/** Drop first N ~100ms frames (line noise). Too high clips early caller speech. */
+const STARTUP_FRAMES_TO_SKIP = 8;
 
 function computeEnergy(mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return 0;
@@ -663,6 +682,11 @@ async function streamTtsToTata(session, rawText) {
       }
     }
 
+    // Allow inbound capture immediately after last byte is sent. Holding botSpeaking true
+    // through playbackWaitMs was dropping all caller audio for seconds after TTS.
+    session.botSpeaking = false;
+    session._bargeInFrames = 0;
+
     const chunksSent = session.outChunkCounter;
     const markName = `reply_${Date.now()}`;
     if (session.ws?.readyState === 1) {
@@ -684,18 +708,17 @@ async function streamTtsToTata(session, rawText) {
       ttsMs: Date.now() - ttsStartMs,
     });
 
-    const playbackWaitMs = Math.max(
-      120,
-      Math.round(audioDurationSec * 1000 * 0.72) - 400
+    // Pacing before next sentence / next TTS only — does not block inbound (botSpeaking already false).
+    const playbackWaitMs = Math.min(
+      650,
+      Math.max(80, Math.round(audioDurationSec * 1000 * 0.22))
     );
     const POLL_INTERVAL = 80;
     let waited = 0;
-    while (waited < playbackWaitMs && session.botSpeaking && !session.closed) {
+    while (waited < playbackWaitMs && !session.closed) {
       await new Promise(r => setTimeout(r, POLL_INTERVAL));
       waited += POLL_INTERVAL;
     }
-    session.botSpeaking = false;
-    session._bargeInFrames = 0;
   } catch (err) {
     session.botSpeaking = false;
     session._ttsSynthesizing = false;
@@ -918,8 +941,8 @@ function handleTataConnection(ws, req) {
         if (!session._mediaFrameCount) session._mediaFrameCount = 0;
         session._mediaFrameCount++;
 
-        // Ignore first ~1.5 seconds — phone line connection noise
-        if (session._mediaFrameCount <= 15) break;
+        // Ignore first ~800ms — line noise; longer window dropped early caller speech
+        if (session._mediaFrameCount <= STARTUP_FRAMES_TO_SKIP) break;
 
         if (session.botSpeaking) {
           const energy = computeEnergy(Buffer.from(payload, 'base64'));
@@ -949,7 +972,7 @@ function handleTataConnection(ws, req) {
         const audioBuf = Buffer.from(payload, 'base64');
         const energy = computeEnergy(audioBuf);
 
-        if (session._mediaFrameCount <= 3 || session._mediaFrameCount % 200 === 0) {
+        if (session._mediaFrameCount <= STARTUP_FRAMES_TO_SKIP + 5 || session._mediaFrameCount % 200 === 0) {
           logger.info('[tataStream] Media frame', {
             streamSid: session.streamSid,
             frame: session._mediaFrameCount,

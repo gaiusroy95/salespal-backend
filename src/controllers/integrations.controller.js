@@ -1206,10 +1206,23 @@ exports.listDeployedNumbers = async (req, res, next) => {
       `SELECT value FROM platform_settings WHERE key = 'deployed_numbers' LIMIT 1`
     );
     const cfg = rows[0]?.value && typeof rows[0].value === 'object' ? rows[0].value : {};
-    const calling = Array.isArray(cfg.calling) && cfg.calling.length ? cfg.calling : fallback.calling;
+    let calling = Array.isArray(cfg.calling) && cfg.calling.length ? [...cfg.calling] : [...fallback.calling];
     const whatsapp = Array.isArray(cfg.whatsapp) && cfg.whatsapp.length ? cfg.whatsapp : fallback.whatsapp;
 
-    res.json({ calling, whatsapp });
+    // Tata outbound caller ID must match TATA_CALL_FROM_NUMBER from server env (exact string as configured).
+    const tataFrom = String(env.telephony?.fromNumber || '').trim();
+    if (tataFrom) {
+      const norm = (s) => String(s || '').replace(/\D/g, '');
+      const tNorm = norm(tataFrom);
+      calling = calling.filter((n) => norm(n) !== tNorm);
+      calling.unshift(tataFrom);
+    }
+
+    res.json({
+      calling,
+      whatsapp,
+      tataCallFromNumber: tataFrom || null,
+    });
   } catch (err) {
     next(err);
   }

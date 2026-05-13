@@ -39,6 +39,10 @@ router.post('/campaigns/:campaignId/leads', [
   body('name').notEmpty().withMessage('Lead name is required'),
   body('phone').notEmpty().withMessage('Phone is required'),
 ], validate, ctrl.addCampaignLead);
+router.delete('/campaigns/:campaignId/leads/:leadId', [
+  param('campaignId').isUUID(),
+  param('leadId').isUUID(),
+], validate, ctrl.deleteCampaignLead);
 
 router.get(
   '/:id/actions',

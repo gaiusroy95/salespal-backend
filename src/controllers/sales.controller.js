@@ -347,6 +347,25 @@ async function addCampaignLead(req, res, next) {
   }
 }
 
+async function deleteCampaignLead(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+
+    const { rowCount } = await db.query(
+      `DELETE FROM campaign_leads
+       WHERE id = $1 AND campaign_id = $2 AND org_id = $3`,
+      [req.params.leadId, req.params.campaignId, orgId]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign lead not found' } });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 const LEAD_ACTION_TYPES = new Set(['call', 'whatsapp', 'email', 'note', 'meeting', 'ai_action']);
 
 function parseDurationSecondsFromLabel(label) {
@@ -2391,6 +2410,7 @@ module.exports = {
   listCampaignGoalSamples,
   listCampaignLeads,
   addCampaignLead,
+  deleteCampaignLead,
   createAutomationJob,
   dispatchDueAutomationJobs,
   dispatchOwnerDailyReports,

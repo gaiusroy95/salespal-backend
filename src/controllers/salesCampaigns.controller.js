@@ -165,13 +165,43 @@ exports.uploadPdfLeads = async (req, res, next) => {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
     }
 
-    const leads = await leadUploadService.parsePdfLeads(req.file.buffer);
+    const parsed = await leadUploadService.parsePdfLeads(req.file.buffer);
+    const leads = parsed.leads || [];
     const insertedCount = await insertImportedCampaignLeads({
       leads,
       campaignId,
       orgId,
       userId: req.user.id,
     });
+
+    if (insertedCount === 0) {
+      const issues = [...(parsed.issues || [])];
+      if (leads.length > 0) {
+        issues.push(
+          `${leads.length} contact-like line(s) were found but none could be saved (each lead needs at least a phone number or email).`
+        );
+      }
+      const missing = [];
+      if (parsed.parseFailed) missing.push('A valid, readable PDF file');
+      else if ((parsed.textLength || 0) < 30) missing.push('Searchable text in the PDF (not only scanned images)');
+      else if (leads.length === 0) missing.push('Plain-text phone numbers or email addresses in the document');
+      else missing.push('At least one row with a usable phone number or email address');
+
+      return res.status(400).json({
+        error: {
+          code: 'PDF_NO_IMPORTABLE_LEADS',
+          message: issues[0] || 'No leads could be imported from this PDF.',
+          details: {
+            issues,
+            missing,
+            textCharactersExtracted: parsed.textLength ?? 0,
+            pageCount: parsed.numpages ?? 0,
+            parsedRows: leads.length,
+            inserted: 0,
+          },
+        },
+      });
+    }
 
     res.json({
       leads,

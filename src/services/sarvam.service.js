@@ -209,6 +209,8 @@ async function synthesizeSpeech({
   const pace = Number(env?.integrations?.sarvamPace ?? process.env.SARVAM_TTS_PACE);
   if (Number.isFinite(pace) && pace >= 0.5 && pace <= 2.0) {
     body.pace = pace;
+  } else if (String(process.env.SARVAM_TTS_NO_PACE || '').trim() !== '1') {
+    body.pace = 0.93;
   }
 
   const res = await fetch(endpoint, {

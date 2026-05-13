@@ -80,6 +80,8 @@ async function createInboundVoiceSession(callerPhone) {
       humanTakeoverActive: false,
       voiceGender: 'unknown',
       inboundAutoCreated: true,
+      mirrorSpokenLanguage: true,
+      openerTtsLocale: 'hing',
     };
 
     await db.query(
@@ -117,6 +119,8 @@ async function createInboundVoiceSession(callerPhone) {
     orgId,
     userId,
     locale,
+    mirrorSpokenLanguage: true,
+    openerTtsLocale: 'hing',
     projectName: projectName || '',
     projectId: projectId || '',
     openerText,
@@ -239,10 +243,10 @@ function stripWavHeader(wavBuf) {
 
 // ─── Voice Activity Detection (energy-based) ────────────────────────────────
 
-const SILENCE_THRESHOLD = 120;
-const SILENCE_FRAMES_NEEDED = 7;   // ~700ms of silence → process (natural pause)
-const MAX_BUFFER_SECONDS = 15;
-const MIN_SPEECH_BYTES = 2400;     // ~300ms of real speech minimum to avoid noise bursts
+const SILENCE_THRESHOLD = 110;
+const SILENCE_FRAMES_NEEDED = 5;   // ~500ms silence → end utterance (snappier turn-taking)
+const MAX_BUFFER_SECONDS = 12;
+const MIN_SPEECH_BYTES = 1920;     // ~240ms speech — catch short “yes / hello” without noise-only triggers
 
 function computeEnergy(mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return 0;
@@ -265,6 +269,8 @@ function createStreamSession(streamSid, callSid, meta) {
     userId: meta.userId || null,
     locale: meta.locale || 'hing',
     detectedLocale: null,
+    mirrorSpokenLanguage: Boolean(meta.mirrorSpokenLanguage),
+    openerTtsLocale: meta.openerTtsLocale || null,
     projectName: meta.projectName || null,
     projectId: meta.projectId || null,
     leadName: meta.leadName || null,
@@ -322,7 +328,17 @@ function detectLanguageFromStt(sttResult, transcript) {
   return null;
 }
 
-function effectiveLocale(session) {
+function sttEffectiveLocale(session) {
+  if (session.mirrorSpokenLanguage && !session.detectedLocale) return 'hing';
+  return session.detectedLocale || session.locale || 'hing';
+}
+
+function ttsPickLocale(session) {
+  if (!session.openerPlayed && session.openerTtsLocale) return session.openerTtsLocale;
+  if (session.mirrorSpokenLanguage) {
+    if (session.detectedLocale) return session.detectedLocale;
+    return session.openerTtsLocale || session.locale || 'hing';
+  }
   return session.detectedLocale || session.locale || 'hing';
 }
 
@@ -379,17 +395,34 @@ function splitIntoSentences(text) {
   const raw = String(text || '').trim();
   if (!raw) return [];
   const parts = raw.split(/(?<=[.!?।\n])\s+/);
-  const sentences = [];
+  const merged = [];
   let current = '';
   for (const p of parts) {
     current += (current ? ' ' : '') + p;
-    if (current.length >= 30 || p === parts[parts.length - 1]) {
-      sentences.push(current.trim());
+    if (current.length >= 48 || p === parts[parts.length - 1]) {
+      merged.push(current.trim());
       current = '';
     }
   }
-  if (current.trim()) sentences.push(current.trim());
-  return sentences.filter(Boolean);
+  if (current.trim()) merged.push(current.trim());
+
+  const out = [];
+  for (const seg of merged) {
+    if (seg.length <= 100) {
+      out.push(seg);
+      continue;
+    }
+    let rest = seg;
+    while (rest.length > 100) {
+      const slice = rest.slice(0, 100);
+      const comma = slice.lastIndexOf(',');
+      const cut = comma > 35 ? comma + 1 : slice.lastIndexOf(' ') > 25 ? slice.lastIndexOf(' ') + 1 : 100;
+      out.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) out.push(rest);
+  }
+  return out.filter(Boolean);
 }
 
 async function processUtterance(session) {
@@ -415,7 +448,7 @@ async function processUtterance(session) {
     const pcm16_8k = mulawBufToPcm16(mulawFull);
     const wavBuf = wrapPcm16AsWav(pcm16_8k, 8000);
 
-    const currentLocale = effectiveLocale(session);
+    const currentLocale = sttEffectiveLocale(session);
     logger.info('[tataStream] STT start', {
       streamSid: session.streamSid,
       audioBytes: mulawFull.length,
@@ -468,7 +501,7 @@ async function processUtterance(session) {
     logger.info('[tataStream] STT result', {
       streamSid: session.streamSid,
       transcript: transcript.slice(0, 200),
-      locale: effectiveLocale(session),
+      locale: sttEffectiveLocale(session),
       sttMs,
     });
 
@@ -484,7 +517,7 @@ async function processUtterance(session) {
       text: transcript,
       orgId: session.orgId,
       userId: session.userId,
-      detectedLocale: effectiveLocale(session),
+      detectedLocale: sttEffectiveLocale(session),
     });
     const aiMs = Date.now() - aiStartMs;
 
@@ -562,7 +595,7 @@ async function streamTtsToTata(session, rawText) {
 
   try {
     session._ttsSynthesizing = true;
-    const ttsLocale = effectiveLocale(session);
+    const ttsLocale = ttsPickLocale(session);
     const ttsStartMs = Date.now();
     logger.info('[tataStream] TTS synthesis starting', {
       streamSid: session.streamSid,
@@ -575,7 +608,7 @@ async function streamTtsToTata(session, rawText) {
       locale: ttsLocale,
       speaker: process.env.SARVAM_TTS_SPEAKER || 'priya',
       model: 'bulbul:v3',
-      speechSampleRate: '22050',
+      speechSampleRate: '24000',
     });
     session._ttsSynthesizing = false;
 
@@ -604,7 +637,7 @@ async function streamTtsToTata(session, rawText) {
       srcRate: sampleRate,
     });
 
-    const CHUNK_SIZE = 3200;
+    const CHUNK_SIZE = 1600;
     for (let offset = 0; offset < mulawOut.length; offset += CHUNK_SIZE) {
       if (session.closed || !session.botSpeaking) break;
       let chunk = mulawOut.subarray(offset, offset + CHUNK_SIZE);
@@ -651,8 +684,11 @@ async function streamTtsToTata(session, rawText) {
       ttsMs: Date.now() - ttsStartMs,
     });
 
-    const playbackWaitMs = Math.max(0, Math.round(audioDurationSec * 1000) - 500);
-    const POLL_INTERVAL = 100;
+    const playbackWaitMs = Math.max(
+      120,
+      Math.round(audioDurationSec * 1000 * 0.72) - 400
+    );
+    const POLL_INTERVAL = 80;
     let waited = 0;
     while (waited < playbackWaitMs && session.botSpeaking && !session.closed) {
       await new Promise(r => setTimeout(r, POLL_INTERVAL));
@@ -758,7 +794,11 @@ function handleTataConnection(ws, req) {
               pendingOutboundContext.delete(cacheKey);
               if (meta.conversationId && !meta.openerText) {
                 const dbCtx = await loadSessionContext(meta.conversationId);
-                if (dbCtx && dbCtx.openerText) meta.openerText = dbCtx.openerText;
+                if (dbCtx) {
+                  if (dbCtx.openerText) meta.openerText = dbCtx.openerText;
+                  if (dbCtx.mirrorSpokenLanguage) meta.mirrorSpokenLanguage = true;
+                  if (dbCtx.openerTtsLocale) meta.openerTtsLocale = dbCtx.openerTtsLocale;
+                }
               }
               break;
             }
@@ -809,6 +849,8 @@ function handleTataConnection(ws, req) {
             if (!meta.projectName && dbCtx.projectName) meta.projectName = dbCtx.projectName;
             if (!meta.projectId && dbCtx.projectId) meta.projectId = dbCtx.projectId;
             if (!meta.leadName && dbCtx.leadName) meta.leadName = dbCtx.leadName;
+            if (dbCtx.mirrorSpokenLanguage) meta.mirrorSpokenLanguage = true;
+            if (dbCtx.openerTtsLocale) meta.openerTtsLocale = dbCtx.openerTtsLocale;
             logger.info('[tataStream] Enriched from DB', {
               streamSid,
               hasOpener: Boolean(meta.openerText),
@@ -879,15 +921,12 @@ function handleTataConnection(ws, req) {
         // Ignore first ~1.5 seconds — phone line connection noise
         if (session._mediaFrameCount <= 15) break;
 
-        // During TTS synthesis (API call in flight), ignore all incoming audio
-        if (session._ttsSynthesizing) break;
-
         if (session.botSpeaking) {
           const energy = computeEnergy(Buffer.from(payload, 'base64'));
-          if (energy > SILENCE_THRESHOLD * 2) {
+          if (energy > SILENCE_THRESHOLD * 1.65) {
             if (!session._bargeInFrames) session._bargeInFrames = 0;
             session._bargeInFrames++;
-            if (session._bargeInFrames >= 5) {
+            if (session._bargeInFrames >= 4) {
               logger.info('[tataStream] Barge-in detected — stopping bot speech', {
                 streamSid: session.streamSid,
                 energy: Math.round(energy),
@@ -1049,11 +1088,21 @@ function parseSessionMeta(customParams, req) {
   const qConvId = url.searchParams.get('conversationId') || url.searchParams.get('conversation_id') || '';
   const qOrgId = url.searchParams.get('orgId') || url.searchParams.get('org_id') || '';
   const qUserId = url.searchParams.get('userId') || url.searchParams.get('user_id') || '';
+  const qMirror = url.searchParams.get('mirror') || url.searchParams.get('mirror_lang') || '';
+  const qOpl = url.searchParams.get('opl') || url.searchParams.get('opener_locale') || '';
 
   const conversationId = cid.salespal_conversation_id || cid.conversationId || qConvId || '';
   const orgId = cid.orgId || cid.org_id || qOrgId || null;
   const userId = cid.userId || cid.user_id || qUserId || null;
   const locale = cid.locale || url.searchParams.get('locale') || 'hing';
+  const mirrorSpokenLanguage = Boolean(
+    Number(cid.mirror_lang) ||
+      cid.mirror_lang === true ||
+      cid.mirrorSpokenLanguage ||
+      qMirror === '1'
+  );
+  const openerTtsLocale =
+    String(cid.opener_locale || cid.openerTtsLocale || qOpl || '').trim().slice(0, 12) || null;
   const projectName = cid.project_name || cid.projectName || '';
   const projectId = cid.project_id || cid.projectId || '';
   const openerText = cid.opener || '';
@@ -1061,7 +1110,20 @@ function parseSessionMeta(customParams, req) {
   const callerNumber = url.searchParams.get('fromNumber') || url.searchParams.get('from') || '';
   const calledNumber = url.searchParams.get('toNumber') || url.searchParams.get('to') || '';
 
-  return { conversationId, orgId, userId, locale, projectName, projectId, openerText, leadName, callerNumber, calledNumber };
+  return {
+    conversationId,
+    orgId,
+    userId,
+    locale,
+    mirrorSpokenLanguage,
+    openerTtsLocale,
+    projectName,
+    projectId,
+    openerText,
+    leadName,
+    callerNumber,
+    calledNumber,
+  };
 }
 
 /**
@@ -1132,12 +1194,17 @@ async function loadSessionContext(conversationId) {
       [conversationId]
     );
     const opener = turnRows[0]?.content || '';
+    const mirrorSpokenLanguage = Boolean(md.mirrorSpokenLanguage);
+    const openerTtsLocale =
+      String(md.openerTtsLocale || md.opener_locale || '').trim().slice(0, 12) || null;
 
     return {
       conversationId: row.conversation_id,
       orgId: row.org_id,
       userId: row.user_id,
       locale: row.locale || 'hing',
+      mirrorSpokenLanguage,
+      openerTtsLocale,
       projectName: md.voiceProjectName || '',
       projectId: md.projectId || '',
       openerText: opener,
@@ -1200,6 +1267,9 @@ function handleVoiceStreamResolve(req, res) {
     if (cid.orgId) params.set('orgId', cid.orgId);
     if (cid.userId) params.set('userId', cid.userId);
     if (cid.locale) params.set('locale', cid.locale);
+    if (Number(cid.mirror_lang) || cid.mirror_lang === true || cid.mirrorSpokenLanguage) params.set('mirror', '1');
+    const opl = String(cid.opener_locale || cid.openerTtsLocale || '').trim().slice(0, 12);
+    if (opl) params.set('opl', opl);
 
     if (cid.salespal_conversation_id) {
       const ctxKey = String(toNumber || fromNumber || callId || '').replace(/[^\d]/g, '').slice(-10);
@@ -1209,6 +1279,11 @@ function handleVoiceStreamResolve(req, res) {
           orgId: cid.orgId || null,
           userId: cid.userId || null,
           locale: cid.locale || 'hing',
+          mirrorSpokenLanguage: Boolean(
+            Number(cid.mirror_lang) || cid.mirror_lang === true || cid.mirrorSpokenLanguage
+          ),
+          openerTtsLocale:
+            String(cid.opener_locale || cid.openerTtsLocale || '').trim().slice(0, 12) || null,
           projectName: cid.project_name || '',
           projectId: cid.project_id || '',
           openerText: cid.opener || '',

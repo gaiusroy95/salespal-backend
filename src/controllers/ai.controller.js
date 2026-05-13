@@ -42,16 +42,17 @@ async function getOrgId(userId) {
 }
 
 async function resolveLeadVoiceProfile(leadId, orgId) {
-  if (!leadId || !orgId) return { gender: 'unknown', timezone: '' };
+  if (!leadId || !orgId) return { gender: 'unknown', timezone: '', preferredLocale: 'hing' };
   try {
     const { rows } = await db.query(`SELECT metadata FROM leads WHERE id = $1 AND org_id = $2 LIMIT 1`, [leadId, orgId]);
     const md = rows[0]?.metadata && typeof rows[0].metadata === 'object' ? rows[0].metadata : {};
     const rawGender = String(md.voiceGender || md.gender || md.sex || '').toLowerCase();
     const gender = rawGender === 'male' || rawGender === 'female' ? rawGender : 'unknown';
     const timezone = String(md.leadTimezone || md.timezone || '').trim();
-    return { gender, timezone };
+    const preferredLocale = String(md.preferredLocale || 'hing').toLowerCase().trim() || 'hing';
+    return { gender, timezone, preferredLocale };
   } catch {
-    return { gender: 'unknown', timezone: '' };
+    return { gender: 'unknown', timezone: '', preferredLocale: 'hing' };
   }
 }
 
@@ -480,6 +481,8 @@ async function startVoiceSession(req, res, next) {
       projectId,
       agentName,
       voiceGenderDetected,
+      mirrorSpokenLanguage,
+      openerLocale,
     } = req.body || {};
     const effectiveBrandId = String(
       brandId || (req.user?.id ? `web-${req.user.id}` : 'web-demo')
@@ -490,7 +493,12 @@ async function startVoiceSession(req, res, next) {
       membershipOrgId || (req.user?.id && leadId ? await resolveEffectiveOrgIdForVoice(req.user.id, leadId, null) : null);
     const leadProfile = await resolveLeadVoiceProfile(leadId, orgId);
     const autoLocale = resolveLocaleFromDialCode(phone);
-    const effectiveLocale = String(locale || '').trim() || autoLocale || 'en';
+    const mirror = Boolean(mirrorSpokenLanguage);
+    const openerTts = String(openerLocale || '').trim().toLowerCase() || null;
+    let effectiveLocale = String(locale || '').trim() || autoLocale || 'hing';
+    if (mirror) {
+      effectiveLocale = 'hing';
+    }
     const genderDetected = String(voiceGenderDetected || '').toLowerCase();
     const voiceGender =
       genderDetected === 'male' || genderDetected === 'female'
@@ -515,6 +523,8 @@ async function startVoiceSession(req, res, next) {
       voiceGender,
       orgId,
       userId,
+      mirrorSpokenLanguage: mirror,
+      openerTtsLocale: mirror ? openerTts || String(leadProfile.preferredLocale || 'hing').toLowerCase() : null,
     });
 
     res.json({

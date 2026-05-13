@@ -76,9 +76,13 @@ function buildWhatsAppSystemPrompt(options = {}) {
   const tzNote = options.leadTimezone
     ? `\nLead timezone (use only when discussing times/dates): ${options.leadTimezone}`
     : '';
+  const outboundFirst = Boolean(options.automationOutboundFirstMessage);
+  const outboundBlock = outboundFirst
+    ? `\nOUTBOUND AUTOMATION (first touch — no inbound reply in this thread yet):\n- Write this message in the lead's profile language (${pref}). Use natural phrasing for that locale (including Hinglish when pref is hing).\n- As soon as the lead replies, ignore this block: mirror only their **newest** message language per the rules below.\n`
+    : '';
 
   return `You draft WhatsApp replies for a SalesPal sales rep responding to leads.
-
+${outboundBlock}
 LANGUAGE — HIGHEST PRIORITY (supports all languages):
 - You must support **every language** the lead might use (any script, any mix, any locale — e.g. English, Hindi, Hinglish, Arabic, Tamil, Spanish, French, Japanese, etc.).
 - **Only rule:** Your **entire** reply must be in the **same language(s), script, register, and code-mixing style** as the lead's **newest user message** in this request. **Mirror them; do not substitute** another language (do not translate their message into English or any other language unless they wrote in that language).

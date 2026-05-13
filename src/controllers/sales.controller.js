@@ -433,6 +433,34 @@ async function getUserHumanPersona(userId) {
   return aiService.normalizeHumanPersonaPreset(sales.aiPersona || 'friendly_consultant');
 }
 
+function mapSalesAiLangToLocale(aiLang) {
+  const key = String(aiLang || 'English').trim();
+  const m = {
+    English: 'en',
+    Hindi: 'hi',
+    Gujarati: 'gu',
+    Marathi: 'mr',
+    Tamil: 'ta',
+    Telugu: 'te',
+  };
+  return m[key] || 'hing';
+}
+
+async function getUserSalesAutomationLanguageSettings(userId) {
+  try {
+    const { rows } = await db.query(
+      `SELECT metadata->'settings'->'sales' AS sales FROM users WHERE id = $1 LIMIT 1`,
+      [userId]
+    );
+    const sales = rows[0]?.sales && typeof rows[0].sales === 'object' ? rows[0].sales : {};
+    const mirror = sales.automationMirrorCustomerLanguage !== false;
+    const aiLang = String(sales.aiLang || 'English').trim();
+    return { mirror, aiLang };
+  } catch {
+    return { mirror: true, aiLang: 'English' };
+  }
+}
+
 const DEFAULT_CALL_WINDOW_START_HOUR = 9;
 const DEFAULT_CALL_WINDOW_END_HOUR = 21; // exclusive
 const OUTBOUND_DND_START_HOUR = 21;
@@ -1233,7 +1261,12 @@ async function dispatchDueAutomationJobs(req, res, next) {
           continue;
         }
         try {
-          const locale = leadMetadata.preferredLocale || 'hing';
+          const { mirror: autoLangMirror, aiLang: fixedAiLang } = await getUserSalesAutomationLanguageSettings(
+            req.user.id
+          );
+          const leadPref = String(leadMetadata.preferredLocale || 'hing').toLowerCase().trim() || 'hing';
+          const openerLocale = autoLangMirror ? leadPref : mapSalesAiLangToLocale(fixedAiLang);
+          const sessionLocale = autoLangMirror ? 'hing' : openerLocale;
           const projectId = leadMetadata.projectId || null;
           const agentName = leadMetadata.agentName || 'SalesPal AI';
           const tpl = (job.payload && typeof job.payload === 'object' && String(job.payload.messageTemplate || '').trim()) || '';
@@ -1247,13 +1280,15 @@ async function dispatchDueAutomationJobs(req, res, next) {
             leadId: job.lead_id,
             phone: job.contact_phone,
             name: leadName,
-            locale,
+            locale: sessionLocale,
             mode: 'automation',
             openerContext,
             projectId,
             agentName,
             orgId,
             userId: req.user.id,
+            mirrorSpokenLanguage: autoLangMirror,
+            openerTtsLocale: autoLangMirror ? openerLocale : null,
           });
 
           await db.query(
@@ -1375,7 +1410,11 @@ async function dispatchDueAutomationJobs(req, res, next) {
         let outboundText = requestedTemplate;
         if (!outboundText) {
           try {
-            const leadLocale = leadMetadata.preferredLocale || 'hing';
+            const { mirror: waAutoLangMirror, aiLang: waFixedAiLang } = await getUserSalesAutomationLanguageSettings(
+              req.user.id
+            );
+            const leadPref = String(leadMetadata.preferredLocale || 'hing').toLowerCase().trim() || 'hing';
+            const outboundLocaleForPrompt = waAutoLangMirror ? leadPref : mapSalesAiLangToLocale(waFixedAiLang);
             const humanPersona = await getUserHumanPersona(req.user.id).catch(() => 'friendly_consultant');
             const projectPrompt = await buildLeadProjectKnowledgePrompt({
               orgId,
@@ -1391,8 +1430,9 @@ async function dispatchDueAutomationJobs(req, res, next) {
                 },
               ],
               `${aiService.systemPromptForChat('whatsapp', {
-                leadPreferredLocale: leadLocale,
+                leadPreferredLocale: outboundLocaleForPrompt,
                 humanPersona,
+                automationOutboundFirstMessage: true,
               })}\n\n${projectPrompt}`,
               { temperature: 0.6 }
             );

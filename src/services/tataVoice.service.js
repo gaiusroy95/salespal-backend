@@ -126,7 +126,18 @@ function bodyLooksRejected(data) {
 const OPENER_PAYLOAD_MAX_LEN = 950;
 const CUSTOM_IDENTIFIER_MAX_LEN = 1800;
 
-function buildCustomIdentifierPayload({ conversationId, opener, projectName, projectId, leadName, locale, orgId, userId }) {
+function buildCustomIdentifierPayload({
+  conversationId,
+  opener,
+  projectName,
+  projectId,
+  leadName,
+  locale,
+  orgId,
+  userId,
+  mirrorSpokenLanguage = false,
+  openerTtsLocale = null,
+}) {
   const base = {
     v: 2,
     salespal_conversation_id: conversationId,
@@ -138,6 +149,8 @@ function buildCustomIdentifierPayload({ conversationId, opener, projectName, pro
     orgId: orgId ? String(orgId).trim().slice(0, 60) : '',
     userId: userId ? String(userId).trim().slice(0, 60) : '',
   };
+  if (mirrorSpokenLanguage) base.mirror_lang = 1;
+  if (openerTtsLocale) base.opener_locale = String(openerTtsLocale).trim().slice(0, 12);
   let s = JSON.stringify(base);
   if (s.length <= CUSTOM_IDENTIFIER_MAX_LEN) return s;
   base.opener = String(opener || '').trim().slice(0, 360);
@@ -176,6 +189,8 @@ async function postLegacyClickToCall(apiUrl, headers, payloadBase) {
     locale: payloadBase.locale,
     orgId: payloadBase.orgId,
     userId: payloadBase.userId,
+    mirrorSpokenLanguage: payloadBase.mirrorSpokenLanguage,
+    openerTtsLocale: payloadBase.openerTtsLocale,
   });
 
   const payload = {
@@ -251,6 +266,8 @@ async function postSupportClickToCall(apiUrl, payloadBase) {
     locale: payloadBase.locale,
     orgId: payloadBase.orgId,
     userId: payloadBase.userId,
+    mirrorSpokenLanguage: payloadBase.mirrorSpokenLanguage,
+    openerTtsLocale: payloadBase.openerTtsLocale,
   });
 
   const payload = {
@@ -344,6 +361,8 @@ async function placeOutboundCall({
   locale = null,
   orgId = null,
   userId = null,
+  mirrorSpokenLanguage = false,
+  openerTtsLocale = null,
 }) {
   if (!isTelephonyEnabled()) {
     return {
@@ -399,6 +418,8 @@ async function placeOutboundCall({
     locale,
     orgId,
     userId,
+    mirrorSpokenLanguage: Boolean(mirrorSpokenLanguage),
+    openerTtsLocale: openerTtsLocale ? String(openerTtsLocale).trim().slice(0, 12) : null,
   };
 
   try {

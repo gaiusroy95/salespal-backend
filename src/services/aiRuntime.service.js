@@ -861,11 +861,17 @@ async function createVoiceSession({
   voiceGender,
   orgId,
   userId,
+  mirrorSpokenLanguage = false,
+  openerTtsLocale = null,
 }) {
   const conversationId = newExternalId('vs');
   const contactName = name || 'User';
   const safeAgentName = normalizeAgentName(agentName);
   const voiceStylePersona = await getUserHumanPersona(userId).catch(() => 'friendly_consultant');
+  const mirror = Boolean(mirrorSpokenLanguage);
+  const openerTts = String(openerTtsLocale || '').trim().toLowerCase() || null;
+  const sessionLocaleForDb = mirror ? 'hing' : String(locale || 'hing').toLowerCase();
+  const openerBuildLocale = mirror ? (openerTts || String(locale || '').trim().toLowerCase() || 'hing') : String(locale || 'hing').toLowerCase();
   let voiceProjectBrief = '';
   let voiceProjectName = null;
   let voiceProjectHasKnowledge = false;
@@ -893,6 +899,8 @@ async function createVoiceSession({
     voiceProjectHasKnowledge,
     humanTakeoverActive: false,
     voiceGender: String(voiceGender || 'unknown').toLowerCase(),
+    mirrorSpokenLanguage: mirror,
+    openerTtsLocale: mirror ? openerTts || openerBuildLocale : null,
   };
   let mergedOpenerContext = String(openerContext || '').trim();
   if (leadId) {
@@ -912,7 +920,7 @@ async function createVoiceSession({
   if (willDialPstn) {
     if (voiceProjectName) {
       opener = buildStrictTelephonyProjectOpener({
-        locale: locale || 'hing',
+        locale: openerBuildLocale,
         contactName,
         projectName: voiceProjectName,
         projectBrief: voiceProjectBrief,
@@ -921,7 +929,7 @@ async function createVoiceSession({
     } else if (projectId) {
       console.warn('[aiRuntime] PSTN dial missing display project name — using fallback opener wording.');
       opener = buildStrictTelephonyProjectOpener({
-        locale: locale || 'hing',
+        locale: openerBuildLocale,
         contactName,
         projectName: 'your selected CRM project',
         projectBrief: voiceProjectBrief,
@@ -929,7 +937,7 @@ async function createVoiceSession({
       });
     } else {
       opener = await buildContextualVoiceOpener({
-        locale: locale || 'hing',
+        locale: openerBuildLocale,
         contactName,
         openerContext: mergedOpenerContext,
         projectBrief: voiceProjectBrief,
@@ -937,12 +945,12 @@ async function createVoiceSession({
         voiceGender: metadata.voiceGender,
       });
       if (voiceProjectName) {
-        opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+        opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, openerBuildLocale);
       }
     }
   } else {
     opener = await buildContextualVoiceOpener({
-      locale: locale || 'hing',
+      locale: openerBuildLocale,
       contactName,
       openerContext: mergedOpenerContext,
       projectBrief: voiceProjectBrief,
@@ -950,7 +958,7 @@ async function createVoiceSession({
       voiceGender: metadata.voiceGender,
     });
     if (voiceProjectName) {
-      opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, locale || 'hing');
+      opener = ensureOpenerNamesProjectListing(opener, voiceProjectName, openerBuildLocale);
     }
   }
 
@@ -966,7 +974,7 @@ async function createVoiceSession({
       leadId || null,
       phone || null,
       contactName,
-      locale || 'hing',
+      sessionLocaleForDb,
       mode || null,
       JSON.stringify(metadata),
     ]
@@ -994,9 +1002,11 @@ async function createVoiceSession({
       opener,
       projectName: voiceProjectName || null,
       projectId: projectId || null,
-      locale: locale || 'hing',
+      locale: sessionLocaleForDb,
       orgId: orgId || null,
       userId: userId || null,
+      mirrorSpokenLanguage: mirror,
+      openerTtsLocale: mirror ? metadata.openerTtsLocale || openerBuildLocale : null,
     });
     const style = typeof telephony.apiStyle === 'string' ? telephony.apiStyle : tataVoiceService.resolveApiStyle();
     if (telephony.accepted && style === 'legacy') {
@@ -1185,13 +1195,15 @@ ${greetingRule}
 - If they asked a question, ANSWER it. If they made a statement, REACT to it.
 - If you cannot understand what they said (garbled audio, noise), say "Sorry, I didn't catch that. Could you say that again?" — do NOT guess or ignore it.
 - NEVER repeat information you already said in earlier turns. Read the conversation history carefully.
-- Keep each reply to 1-3 short spoken sentences. On a phone, long replies sound robotic.
+- Keep each reply to ONE or TWO short spoken sentences — one flowing thought sounds human; choppy fragments sound robotic.
+- Do not trail off mid-sentence (no incomplete clauses like "The location is…"). Finish the thought or ask a brief follow-up.
 - Use natural reactions: "sure", "right", "absolutely", "got it", "that's a great question".
 
 LANGUAGE:
 - Match the caller's language exactly. If they speak Hindi, reply in Hindi. If Hinglish, use Hinglish. If English, use English.
 - Mirror their tone, formality, and style naturally.
 - Session default: ${sessionLocale}. Only use this if the caller's language is unclear.
+${mdEarly.mirrorSpokenLanguage ? '- **Customer-language mode:** Your reply must match the language of the caller\'s latest utterance (the user message you just received). Do not answer in English if they spoke Hindi, Tamil, or another language.\n' : ''}
 - Address them as "${honorificLead}" when using their name.
 
 YOUR PROJECT KNOWLEDGE (use naturally when relevant — NEVER dump all at once):
@@ -1208,7 +1220,7 @@ SPEECH OUTPUT RULES (your reply will be read aloud by text-to-speech):
 ${aiService.SALES_CONVERSATION_FUNNEL_BLOCK}
 ${aiService.humanStyleConsistencyBlock(voiceStylePersona)}`;
 
-  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.5, maxTokens: 250 });
+  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.56, maxTokens: 200 });
 
   await db.query(`INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`, [
     conversationId,

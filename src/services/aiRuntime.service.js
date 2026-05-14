@@ -620,8 +620,25 @@ function isProjectFactQuestion(text) {
   if (!raw.trim()) return false;
   if (/\b(https?:\/\/|www\.)/i.test(raw)) return true;
   const t = raw.toLowerCase();
-  return /(\bwebsite\b|\bweb[\s-]?site\b|\bportal\b|\blanding\b|\burl\b|\bpage\b|\bonline\b|\bवेबसाइट\b|project|property|plot|\blisting\b|inventory|tower|phase|developers?|builders?|community|township|\bflat\b|\bflats\b|\bvilla\b|\bapartment\b|\bbhk\b|brochure|pamphlet|\bfaq\b|rera|\bsite\s+visit\b|\bwalkthrough\b|\bvirtual\s+tour\b|location|address|nearest|metro|maps?|connectivity|pricing|price|rate|cost|emi|booking|possession|amenities|legal|payment\s+plan|acre|sq\.?\s*ft|square\s+feet|yard|hectares?|availability|rera\s+number)/i.test(
+  const englishOrMixed =
+    /(\bwebsite\b|\bweb[\s-]?site\b|\bportal\b|\blanding\b|\burl\b|\bpage\b|\bonline\b|\bवेबसाइट\b|project|property|plot|\blisting\b|inventory|tower|phase|developers?|builders?|community|township|\bflat\b|\bflats\b|\bvilla\b|\bapartment\b|\bbhk\b|brochure|pamphlet|\bfaq\b|rera|\bsite\s+visit\b|\bwalkthrough\b|\bvirtual\s+tour\b|location|address|nearest|metro|maps?|connectivity|pricing|price|rate|cost|emi|booking|possession|amenities|legal|payment\s+plan|acre|sq\.?\s*ft|square\s+feet|yard|hectares?|availability|rera\s+number)/i.test(
+      t
+    );
+  if (englishOrMixed) return true;
+  // Romanized Hindi / Hinglish cues common on phone (STT often outputs Latin script).
+  return /(\b(kya|kyaa|kitna|kitni|kitne|kahan|kahaan|kab|kaun|kaise|kyun|kyu|mujhe|batao|bataiye|btao|dikhao|dikha|dijiye|chahiye|milega|milta|mil|rahe|wali|wala|jaankari|jaan\s*kar|sach|details|detail|sahi|galat)\b)/i.test(
     t
+  );
+}
+
+/** Short affirmations / follow-ups should stay anchored on the listing when a project is active. */
+function isListingFollowUpUtterance(text, projectId) {
+  if (!projectId || !String(text || '').trim()) return false;
+  const t = String(text).trim();
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length <= 6 && t.length <= 40) return true;
+  return /^(haan|ha|hmm|hm|yes|yeah|yep|yup|ok|okay|acha|accha|theek|thik|right|sure|please|ji|haji|bolo|boliye|go\s*ahead|tell\s*me|continue|suniye|sun\s*lo)\b/i.test(
+    t.toLowerCase()
   );
 }
 
@@ -639,7 +656,7 @@ async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, user
       projectId,
       orgId: kbOrgId,
       queryText: queryText || 'project overview pricing location',
-      k: 14,
+      k: 18,
     });
     if (sqlResults.length) return sqlResults;
   } catch (err) {
@@ -653,7 +670,7 @@ async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, user
     [kbOrgId, projectId]
   );
   if (!rows.length) return [];
-  return mergeKnowledgeSemanticAndUrlRows(rows, queryText, 8, 14);
+  return mergeKnowledgeSemanticAndUrlRows(rows, queryText, 10, 18);
 }
 
 async function fetchProjectRecordForVoice({ orgId, projectId }) {
@@ -1133,13 +1150,30 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
     }
   }
 
+  const knowledgeUserId = userId || row.user_id || null;
+
+  const recentUserTurns = chatMessages
+    .filter((m) => m.role === 'user')
+    .slice(-4)
+    .map((m) => String(m.content || '').trim())
+    .filter(Boolean);
+  const contextRollup = recentUserTurns.join('\n').slice(0, 1800);
+  const listingHint =
+    projectId && String(voiceProjectName || '').trim()
+      ? `${voiceProjectName}: brochure pricing location amenities inventory RERA possession payment`
+      : projectId
+        ? 'real estate project listing brochure pricing location amenities'
+        : '';
+  const knowledgeQueryText = [String(text || '').trim(), listingHint, contextRollup].filter(Boolean).join('\n\n').slice(0, 2048);
+
   const topKnowledge = await fetchProjectKnowledgeContext({
     projectId,
-    queryText: text,
+    queryText: knowledgeQueryText,
     leadId: row.lead_id || null,
-    userId,
+    userId: knowledgeUserId,
   });
-  const asksProjectFacts = isProjectFactQuestion(text);
+  const asksProjectFacts =
+    isProjectFactQuestion(text) || isListingFollowUpUtterance(text, projectId);
 
   const pivotWhenProject = projectId
     ? '\n- **Project-first call:** This session has a selected listing. Anchor on it for brochure, "**the website**", portal/pricing links, towers/phases, RERA visits, timelines, paperwork.\n- If the lead mentions a URL or "**official site**", treat it as a question about this listing and answer from KNOWLEDGE BOUNDARY + baseline only unless they clearly switched topic.\n- Off-topic chatter: acknowledge briefly (spoken style), then steer back.\n- Do not invent listing facts beyond KNOWLEDGE BOUNDARY + baseline.'
@@ -1189,9 +1223,23 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
     ? '- This is the FIRST thing the caller said. Respond with a warm, short acknowledgment and ONE question about the project. Do NOT re-introduce yourself (the opener already did that).'
     : `- This is turn #${turnCount} of an ongoing conversation. NEVER greet again. NEVER say "Hello" or introduce yourself. Just respond naturally to what the caller just said.`;
 
+  const sttGroundingBlock = `
+SPEECH-TO-TEXT NOTE:
+- The latest user message is machine-transcribed from a phone line; it may contain noise or homophone errors.
+- If it is clearly garbled, too short to act on, or unrelated noise, say in their language that you did not catch it and ask them to repeat once — do not invent a different question or topic.
+`;
+
+  const listingShortReplyBlock = projectId
+    ? `
+LISTING FOLLOW-UPS:
+- This call is about "${listingLabel}". Very short replies ("yes", "ok", "please tell me", "how much", "where", "hmm") must be read in context of the **last substantive topic** in the transcript and this listing — use PROJECT FACTS + KNOWLEDGE BOUNDARY before generic small talk.
+`
+    : '';
+
   const voiceSystem = `You are a real human on a live phone call. Your name is "${agentName}". You are having a natural two-way conversation.
 
 ${projectMandatoryBlock}${websiteDiscussBlock}${crmBlock}${personaSupervisorBlock}
+${sttGroundingBlock}${listingShortReplyBlock}
 
 CRITICAL — THIS IS A DIALOGUE, NOT A MONOLOGUE:
 ${greetingRule}
@@ -1224,7 +1272,7 @@ SPEECH OUTPUT RULES (your reply will be read aloud by text-to-speech):
 ${aiService.SALES_CONVERSATION_FUNNEL_BLOCK}
 ${aiService.humanStyleConsistencyBlock(voiceStylePersona)}`;
 
-  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.56, maxTokens: 200 });
+  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.4, maxTokens: 240 });
 
   await db.query(`INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`, [
     conversationId,

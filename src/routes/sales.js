@@ -50,6 +50,13 @@ router.get(
   validate,
   ctrl.listLeadActions
 );
+router.get('/:id/engagement', [param('id').isUUID()], validate, ctrl.getLeadEngagement);
+router.get(
+  '/:id/engagement/events',
+  [param('id').isUUID(), query('limit').optional().isInt({ min: 1, max: 200 })],
+  validate,
+  ctrl.listLeadEngagementEvents
+);
 router.post(
   '/:id/actions',
   [

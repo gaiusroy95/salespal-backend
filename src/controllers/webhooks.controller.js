@@ -6,6 +6,7 @@ const whatsappService = require('../services/whatsapp.service');
 const aiService = require('../services/ai.service');
 const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
+const salesEngagement = require('../services/salesEngagement.service');
 
 function headerValue(req, name) {
   if (!name) return '';
@@ -316,6 +317,18 @@ async function tataCallStatus(req, res) {
           ]
         );
 
+        const tataEngEvent = salesEngagement.mapTataCallStatusToEvent(callStatus);
+        if (tataEngEvent) {
+          await salesEngagement
+            .applyEvent({
+              leadId: row.lead_id,
+              event: tataEngEvent,
+              channel: 'voice_pstn',
+              metadata: { providerCallId, callStatus },
+            })
+            .catch((e) => logger.warn('[sales-engagement] Tata status transition skipped', { error: e.message }));
+        }
+
         const badConnect = ['no_answer', 'no-answer', 'busy', 'user_busy', 'failed', 'cancel', 'cancelled', 'cancelled.', 'reject', 'rejected', 'congestion', 'unreachable', 'network_unreachable', 'no_route'];
         const st = callStatus.replace(/\./g, '').toLowerCase();
         const shouldRecover = badConnect.some((x) => st.includes(x.replace(/\./g, '')));
@@ -360,6 +373,14 @@ async function tataCallStatus(req, res) {
                     }),
                   ]
                 );
+                await salesEngagement
+                  .applyEvent({
+                    leadId: row.lead_id,
+                    event: salesEngagement.ENGAGEMENT_EVENTS.WHATSAPP_INTRO_SENT,
+                    channel: 'whatsapp_chat',
+                    metadata: { tataRecoverForCallId: providerCallId, callStatus: st },
+                  })
+                  .catch(() => {});
               }
             } catch (e) {
               logger.warn(`WhatsApp Tata recovery skipped: ${e.message}`);
@@ -429,6 +450,10 @@ async function whatsappInbound(req, res) {
           const actorUserId = lead.assigned_to || lead.user_id;
           const leadMd = lead.metadata && typeof lead.metadata === 'object' ? lead.metadata : {};
 
+          await salesEngagement
+            .getOrCreateSession({ orgId: lead.org_id, leadId: lead.id, userId: actorUserId, leadRow: lead })
+            .catch(() => null);
+
           await db.query(
             `INSERT INTO lead_actions (lead_id, user_id, type, content, outcome, metadata)
              VALUES ($1,$2,'whatsapp',$3,'whatsapp_inbound_lead',$4::jsonb)`,
@@ -454,6 +479,15 @@ async function whatsappInbound(req, res) {
           });
 
           if (isStopIntent(text)) {
+            await salesEngagement
+              .applyEvent({
+                leadId: lead.id,
+                orgId: lead.org_id,
+                event: salesEngagement.ENGAGEMENT_EVENTS.BLOCKED,
+                channel: 'whatsapp_chat',
+                metadata: { reason: 'opt_out' },
+              })
+              .catch(() => {});
             await upsertLeadMetadata(lead.id, {
               whatsappOptOut: true,
               whatsappOptOutAt: new Date().toISOString(),
@@ -478,6 +512,16 @@ async function whatsappInbound(req, res) {
           }
 
           if (asksForHuman(text)) {
+            await salesEngagement
+              .applyEvent({
+                leadId: lead.id,
+                orgId: lead.org_id,
+                event: salesEngagement.ENGAGEMENT_EVENTS.HUMAN_HANDOFF,
+                channel: 'whatsapp_chat',
+                metadata: { reason: 'lead_requested_human' },
+                patch: { humanTakeover: true },
+              })
+              .catch(() => {});
             const takeoverUntilIso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
             await upsertLeadMetadata(lead.id, {
               whatsappHumanTakeoverMode: 'human',
@@ -519,11 +563,23 @@ async function whatsappInbound(req, res) {
             leadCompanyName: lead.company_name || '',
             queryText: text,
           });
+          const engagementPrompt = await salesEngagement.buildEngagementPromptBlock(lead.id).catch(() => '');
+          await salesEngagement
+            .recordConversationSnippet({
+              leadId: lead.id,
+              channel: 'whatsapp_chat',
+              role: 'user',
+              text,
+              orgId: lead.org_id,
+            })
+            .catch(() => {});
+          await salesEngagement.syncQualificationFromText(lead.id, text).catch(() => {});
+
           const systemPrompt = `${aiService.systemPromptForChat('whatsapp', {
             leadPreferredLocale: String(leadMd.preferredLocale || 'hing'),
             leadTimezone: String(leadMd.timezone || env.leadScheduleDefaultTz || 'Asia/Kolkata'),
             humanPersona,
-          })}\n\n${projectPrompt}\n\nPolicy: AI-first support. Try to resolve unless critical risk or explicit human escalation is necessary.`;
+          })}\n\n${engagementPrompt}\n\n${projectPrompt}\n\nPolicy: AI-first support. Try to resolve unless critical risk or explicit human escalation is necessary. Continue the same sales thread across channels — do not re-ask questions already answered on a prior call or chat.`;
           let aiReply = '';
           try {
             aiReply = await aiService.callAIWithMessages(history, systemPrompt, { temperature: 0.6 });
@@ -561,6 +617,15 @@ async function whatsappInbound(req, res) {
             lastInteraction: `Assist Pal reply: ${aiReply.slice(0, 180)}`,
             lastActivityAt: new Date().toISOString(),
           });
+          await salesEngagement
+            .recordConversationSnippet({
+              leadId: lead.id,
+              channel: 'whatsapp_chat',
+              role: 'assistant',
+              text: aiReply,
+              orgId: lead.org_id,
+            })
+            .catch(() => {});
 
           const scheduleAt = inferImmediateOrTimedCall(text) || inferImmediateOrTimedCall(aiReply);
           if (scheduleAt && actorUserId) {

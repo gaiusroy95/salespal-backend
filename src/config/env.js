@@ -153,6 +153,15 @@ const envSchema = z.object({
   SARVAM_STT_MODE: z.string().optional().default('codemix'),
   /** auto (Sarvam if key set) | sarvam | browser (Web Speech API) */
   VOICE_STT_PROVIDER: z.string().optional().default('auto'),
+  /**
+   * Voice stack profile: global_google_default | india_google_sarvam | fast_realtime_deepgram | premium_voice_elevenlabs
+   */
+  VOICE_STACK_PROFILE: z.string().optional().default('india_google_sarvam'),
+  DEEPGRAM_API_KEY: z.string().optional().default(''),
+  ELEVENLABS_API_KEY: z.string().optional().default(''),
+  ELEVENLABS_VOICE_ID: z.string().optional().default(''),
+  /** When true and Vertex Live credentials exist, prefer Gemini Live for global_google_default */
+  GEMINI_LIVE_ENABLED: z.string().optional().default('false'),
 });
 
 const parsed = envSchema.parse(process.env);
@@ -292,6 +301,13 @@ const env = {
   leadScheduleDefaultTz: String(parsed.LEAD_SCHEDULE_DEFAULT_TZ || '').trim(),
   callScriptCompliance: String(parsed.CALL_SCRIPT_AI_COMPLIANCE || 'true').toLowerCase() === 'true',
   voiceTranscriptSafeguards: String(parsed.VOICE_TRANSCRIPT_SAFEGUARDS || 'false').toLowerCase() === 'true',
+  voice: {
+    stackProfile: String(parsed.VOICE_STACK_PROFILE || 'india_google_sarvam').trim().toLowerCase(),
+    deepgramApiKey: String(parsed.DEEPGRAM_API_KEY || '').trim(),
+    elevenLabsApiKey: String(parsed.ELEVENLABS_API_KEY || '').trim(),
+    elevenLabsVoiceId: String(parsed.ELEVENLABS_VOICE_ID || '').trim(),
+    geminiLiveEnabled: String(parsed.GEMINI_LIVE_ENABLED || 'false').toLowerCase() === 'true',
+  },
   GCP_PROJECT_ID: parsed.GCP_PROJECT_ID || '',
   GCP_LOCATION: parsed.GCP_LOCATION || 'us-central1',
 };

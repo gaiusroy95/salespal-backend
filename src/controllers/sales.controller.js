@@ -7,6 +7,7 @@ const aiService = require('../services/ai.service');
 const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
 const tataVoiceService = require('../services/tataVoice.service');
+const salesEngagement = require('../services/salesEngagement.service');
 const { retrieveTopKSql } = require('../services/projectKnowledge.service');
 
 async function getOrgId(userId) {
@@ -170,7 +171,18 @@ async function createDeal(req, res, next) {
         metadata ? JSON.stringify(metadata) : '{}',
       ]
     );
-    res.status(201).json(rows[0]);
+    const lead = rows[0];
+    try {
+      await salesEngagement.getOrCreateSession({
+        orgId,
+        leadId: lead.id,
+        userId: req.user.id,
+        leadRow: lead,
+      });
+    } catch (e) {
+      logger.warn('[sales-engagement] session on lead create skipped', { error: e.message });
+    }
+    res.status(201).json(lead);
   } catch (err) {
     next(err);
   }
@@ -1326,6 +1338,19 @@ async function dispatchDueAutomationJobs(req, res, next) {
             phoneDigitsLen: digitsOnlyPhone(dialPhone).length,
           });
 
+          await salesEngagement
+            .getOrCreateSession({ orgId, leadId: job.lead_id, userId: req.user.id })
+            .catch(() => null);
+          await salesEngagement
+            .applyEvent({
+              leadId: job.lead_id,
+              orgId,
+              event: salesEngagement.ENGAGEMENT_EVENTS.CALL_OUTBOUND_STARTED,
+              channel: 'voice_pstn',
+              metadata: { automationJobId: job.id, kind: payloadObj.kind || null },
+            })
+            .catch(() => {});
+
           const { session, telephony } = await aiRuntime.createVoiceSession({
             brandId: `web-${req.user.id}`,
             leadId: job.lead_id,
@@ -1368,6 +1393,20 @@ async function dispatchDueAutomationJobs(req, res, next) {
             ]
           );
           if (telephony?.enabled && telephony?.accepted) {
+            await salesEngagement
+              .applyEvent({
+                leadId: job.lead_id,
+                orgId,
+                event: salesEngagement.ENGAGEMENT_EVENTS.CALL_CONNECTED,
+                channel: 'voice_pstn',
+                metadata: {
+                  automationJobId: job.id,
+                  conversationId: session.conversationId,
+                  providerCallId: telephony?.providerCallId || null,
+                },
+                patch: { activeVoiceConversationId: session.conversationId },
+              })
+              .catch(() => {});
             const callPlacedMsg = telephony?.providerCallId
               ? `Tata accepted the bot call (Call ID: ${telephony.providerCallId}).`
               : 'Tata accepted the bot call request.';
@@ -2274,6 +2313,18 @@ async function enqueueCampaignCallQueue(req, res, next) {
       } else {
         queued += 1;
         slotCursor += gapSeconds * 1000;
+        await salesEngagement
+          .getOrCreateSession({ orgId, leadId, userId: req.user.id })
+          .catch(() => null);
+        await salesEngagement
+          .applyEvent({
+            leadId,
+            orgId,
+            event: salesEngagement.ENGAGEMENT_EVENTS.CAMPAIGN_NUDGE,
+            channel: 'voice_pstn',
+            metadata: { campaignId, campaignLeadId: cl.id, automationJobId: ins.rows[0].id },
+          })
+          .catch(() => {});
       }
     }
 
@@ -2453,6 +2504,35 @@ async function saveCampaignCommunicationSetup(req, res, next) {
   }
 }
 
+async function getLeadEngagement(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    const leadId = req.params.id;
+    const { rows: leadRows } = await db.query(`SELECT id FROM leads WHERE id = $1 AND org_id = $2`, [leadId, orgId]);
+    if (!leadRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+    const session = await salesEngagement.getOrCreateSession({ orgId, leadId, userId: req.user.id });
+    return res.json({ session });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listLeadEngagementEvents(req, res, next) {
+  try {
+    const orgId = await getOrgId(req.user.id);
+    if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
+    const leadId = req.params.id;
+    const { rows: leadRows } = await db.query(`SELECT id FROM leads WHERE id = $1 AND org_id = $2`, [leadId, orgId]);
+    if (!leadRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+    const lim = parseInt(String(req.query.limit || '50'), 10);
+    const events = await salesEngagement.listEngagementEvents(leadId, lim);
+    return res.json({ events });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listDeals,
   getDeal,
@@ -2480,4 +2560,6 @@ module.exports = {
   updateAutomationJobStatus,
   cleanupLeadAutomationJobs,
   setWhatsAppTakeover,
+  getLeadEngagement,
+  listLeadEngagementEvents,
 };

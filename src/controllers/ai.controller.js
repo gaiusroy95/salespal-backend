@@ -1112,6 +1112,29 @@ async function streamVideoJobMedia(req, res, next) {
   }
 }
 
+const {
+  listVoiceStackProfiles,
+  resolveVoiceStackProfile,
+  PROFILES: VOICE_STACK_PROFILES,
+} = require('../config/voiceStackProfiles');
+const voiceStackArtifacts = require('../services/voiceStackArtifacts.service');
+
+async function listVoiceStackProfilesHandler(req, res) {
+  const active = resolveVoiceStackProfile(process.env.VOICE_STACK_PROFILE);
+  return res.json({
+    activeProfileId: active.id,
+    profiles: listVoiceStackProfiles(),
+  });
+}
+
+async function getVoiceStackProfileArtifacts(req, res) {
+  const profileId = String(req.params.profileId || '').trim().toLowerCase();
+  if (!VOICE_STACK_PROFILES[profileId]) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Unknown voice stack profile' } });
+  }
+  return res.json(voiceStackArtifacts.buildArtifactsForProfile(profileId));
+}
+
 module.exports = {
   chat,
   analyzeCampaign,
@@ -1131,4 +1154,6 @@ module.exports = {
   getVideoJob,
   streamVideoJobMedia,
   scanCallingScriptCompliance,
+  listVoiceStackProfilesHandler,
+  getVoiceStackProfileArtifacts,
 };

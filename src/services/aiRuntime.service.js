@@ -7,6 +7,8 @@ const sarvamService = require('./sarvam.service');
 const { generatePromotionalVideo } = require('./aiVideo.service');
 const { retrieveTopK, retrieveTopKSql, embedSingleText } = require('./projectKnowledge.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
+const salesEngagement = require('./salesEngagement.service');
+const voiceContextSeed = require('./voiceContextSeed.service');
 
 const videoQueue = [];
 const videoQueueRunning = new Set();
@@ -929,6 +931,17 @@ async function createVoiceSession({
     } catch (e) {
       console.warn('[aiRuntime] CRM context for voice opener skipped:', e.message);
     }
+    if (orgId) {
+      try {
+        await salesEngagement.getOrCreateSession({ orgId, leadId, userId });
+        const engBlock = await salesEngagement.buildEngagementPromptBlock(leadId);
+        if (engBlock) {
+          mergedOpenerContext = mergedOpenerContext ? `${mergedOpenerContext}\n\n${engBlock}` : engBlock;
+        }
+      } catch (e) {
+        console.warn('[aiRuntime] Engagement session for voice opener skipped:', e.message);
+      }
+    }
   }
 
   const willDialPstn = Boolean(phone && tataVoiceService.isTelephonyEnabled());
@@ -1001,6 +1014,46 @@ async function createVoiceSession({
     `INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`,
     [conversationId, opener]
   );
+
+  if (leadId && orgId) {
+    try {
+      const seed = await voiceContextSeed.buildVoiceSessionSeed({
+        conversationId,
+        leadId,
+        orgId,
+        userId,
+        contactName,
+        projectName: voiceProjectName,
+      });
+      await voiceContextSeed.persistSeedToVoiceSession(conversationId, seed);
+    } catch (e) {
+      console.warn('[aiRuntime] Voice context seed on session create skipped:', e.message);
+    }
+    try {
+      const voiceEvent = willDialPstn
+        ? salesEngagement.ENGAGEMENT_EVENTS.CALL_OUTBOUND_STARTED
+        : salesEngagement.ENGAGEMENT_EVENTS.CALL_INBOUND_CONNECTED;
+      await salesEngagement.applyEvent({
+        leadId,
+        orgId,
+        event: voiceEvent,
+        channel: willDialPstn ? 'voice_pstn' : 'voice_browser',
+        metadata: { conversationId, mode: mode || null },
+        patch: { activeVoiceConversationId: conversationId },
+      });
+      if (!willDialPstn) {
+        await salesEngagement.applyEvent({
+          leadId,
+          orgId,
+          event: salesEngagement.ENGAGEMENT_EVENTS.CALL_CONNECTED,
+          channel: 'voice_browser',
+          metadata: { conversationId },
+        });
+      }
+    } catch (e) {
+      console.warn('[aiRuntime] Engagement voice session event skipped:', e.message);
+    }
+  }
 
   const sessionRow = await loadVoiceSession(conversationId);
   const turns = await loadVoiceTurns(conversationId);
@@ -1152,6 +1205,22 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
 
   const knowledgeUserId = userId || row.user_id || null;
 
+  if (row.lead_id && (row.org_id || orgId)) {
+    try {
+      await salesEngagement.recordConversationSnippet({
+        leadId: row.lead_id,
+        channel: row.mode === 'automation' || row.brand_id === 'inbound' ? 'voice_pstn' : 'voice_pstn',
+        role: 'user',
+        text,
+        orgId: row.org_id || orgId,
+        conversationId,
+      });
+      await salesEngagement.syncQualificationFromText(row.lead_id, text);
+    } catch (e) {
+      console.warn('[aiRuntime] Engagement turn sync skipped:', e.message);
+    }
+  }
+
   const recentUserTurns = chatMessages
     .filter((m) => m.role === 'user')
     .slice(-4)
@@ -1236,10 +1305,25 @@ LISTING FOLLOW-UPS:
 `
     : '';
 
+  let engagementBlock = '';
+  if (row.lead_id) {
+    try {
+      engagementBlock = await salesEngagement.buildEngagementPromptBlock(row.lead_id);
+    } catch (e) {
+      console.warn('[aiRuntime] Engagement prompt block skipped:', e.message);
+    }
+  }
+  const voiceSeedBlock =
+    mdEarly.voiceContextSeed?.promptBlock && mdEarly.voiceContextSeeded
+      ? String(mdEarly.voiceContextSeed.promptBlock).slice(0, 6000)
+      : '';
+
   const voiceSystem = `You are a real human on a live phone call. Your name is "${agentName}". You are having a natural two-way conversation.
 
 ${projectMandatoryBlock}${websiteDiscussBlock}${crmBlock}${personaSupervisorBlock}
 ${sttGroundingBlock}${listingShortReplyBlock}
+${engagementBlock}
+${voiceSeedBlock}
 
 CRITICAL — THIS IS A DIALOGUE, NOT A MONOLOGUE:
 ${greetingRule}
@@ -1278,6 +1362,21 @@ ${aiService.humanStyleConsistencyBlock(voiceStylePersona)}`;
     conversationId,
     reply,
   ]);
+
+  if (row.lead_id) {
+    try {
+      await salesEngagement.recordConversationSnippet({
+        leadId: row.lead_id,
+        channel: 'voice_pstn',
+        role: 'assistant',
+        text: reply,
+        orgId: row.org_id || orgId,
+        conversationId,
+      });
+    } catch (_) {
+      /* non-fatal */
+    }
+  }
 
   await db.query(`UPDATE ai_voice_sessions SET updated_at = NOW() WHERE conversation_id = $1`, [conversationId]);
 

@@ -20,6 +20,9 @@ const env = require('../config/env');
 const sarvamService = require('./sarvam.service');
 const aiRuntime = require('./aiRuntime.service');
 const db = require('../config/db');
+const voicePipeline = require('./voicePipeline.service');
+const voiceContextSeed = require('./voiceContextSeed.service');
+const { resolveVoiceStackProfile } = require('../config/voiceStackProfiles');
 
 const activeSessions = new Map();
 const pendingOutboundContext = new Map();
@@ -303,12 +306,20 @@ function computeEnergy(mulawBuf) {
 // ─── Session state ──────────────────────────────────────────────────────────
 
 function createStreamSession(streamSid, callSid, meta) {
+  const voiceProfileId =
+    meta.voiceProfileId || env.voice?.stackProfile || process.env.VOICE_STACK_PROFILE || 'india_google_sarvam';
+  const profile = resolveVoiceStackProfile(voiceProfileId);
+  const vad = voicePipeline.getVadConfig({ voiceProfileId });
+  const bargeIn = voicePipeline.getBargeInConfig({ voiceProfileId });
+
   return {
     streamSid,
     callSid,
     conversationId: meta.conversationId || null,
+    leadId: meta.leadId || null,
     orgId: meta.orgId || null,
     userId: meta.userId || null,
+    voiceProfileId: profile.id,
     locale: meta.locale || 'hing',
     detectedLocale: null,
     mirrorSpokenLanguage: Boolean(meta.mirrorSpokenLanguage),
@@ -328,6 +339,12 @@ function createStreamSession(streamSid, callSid, meta) {
     ws: null,
     closed: false,
     createdAt: Date.now(),
+    contextSeeded: false,
+    vadSilenceFramesNeeded: vad.silenceFramesNeeded,
+    vadEnergyThreshold: vad.energyThreshold,
+    bargeInFramesNeeded: bargeIn.framesNeeded,
+    bargeInEnergyMultiplier: bargeIn.energyMultiplier,
+    bargeInEnabled: bargeIn.enabled,
   };
 }
 
@@ -487,24 +504,20 @@ async function processUtterance(session) {
 
   try {
     const mulawFull = Buffer.concat(audioChunks);
-    const pcm16_8k = mulawBufToPcm16(mulawFull);
-    const wavBuf = wrapPcm16AsWav(pcm16_8k, 8000);
-
     const currentLocale = sttEffectiveLocale(session);
     logger.info('[tataStream] STT start', {
       streamSid: session.streamSid,
       audioBytes: mulawFull.length,
       durationSec: (mulawFull.length / 8000).toFixed(1),
       locale: currentLocale,
+      voiceProfile: session.voiceProfileId,
     });
 
     const sttStartMs = Date.now();
-    const sttResult = await sarvamService.transcribeBufferedAudio({
-      env,
-      buffer: wavBuf,
-      filename: 'tata_utterance.wav',
-      mimeType: 'audio/wav',
+    const sttResult = await voicePipeline.transcribeTelephonyUtterance({
+      mulawBuf: mulawFull,
       locale: currentLocale,
+      session,
     });
     const sttMs = Date.now() - sttStartMs;
 
@@ -644,39 +657,28 @@ async function streamTtsToTata(session, rawText) {
       textLen: text.length,
       locale: ttsLocale,
     });
-    const ttsResult = await sarvamService.synthesizeSpeech({
-      env,
+    const telephonyAudio = await voicePipeline.synthesizeForTelephony({
       text,
       locale: ttsLocale,
+      session,
       speaker: process.env.SARVAM_TTS_SPEAKER || 'priya',
-      model: 'bulbul:v3',
-      speechSampleRate: '24000',
     });
     session._ttsSynthesizing = false;
 
+    const mulawOut = telephonyAudio.mulaw;
     logger.info('[tataStream] TTS synthesis done', {
       streamSid: session.streamSid,
-      wavBytes: ttsResult.buffer?.length || 0,
+      mulawBytes: mulawOut?.length || 0,
+      durationSec: telephonyAudio.durationSec?.toFixed?.(1),
       ttsMs: Date.now() - ttsStartMs,
+      voiceProfile: session.voiceProfileId,
     });
-
-    let pcm8k;
-    const { pcm, sampleRate } = stripWavHeader(ttsResult.buffer);
-    if (sampleRate !== 8000) {
-      pcm8k = resamplePcm16(pcm, sampleRate, 8000);
-    } else {
-      pcm8k = pcm;
-    }
-
-    const mulawOut = pcm16ToMulawBuf(pcm8k);
     session.botSpeaking = true;
 
     logger.info('[tataStream] Audio encoded', {
       streamSid: session.streamSid,
-      pcmBytes: pcm8k.length,
       mulawBytes: mulawOut.length,
       durationSec: (mulawOut.length / 8000).toFixed(1),
-      srcRate: sampleRate,
     });
 
     const CHUNK_SIZE = 1600;
@@ -899,6 +901,7 @@ function handleTataConnection(ws, req) {
             if (!meta.projectName && dbCtx.projectName) meta.projectName = dbCtx.projectName;
             if (!meta.projectId && dbCtx.projectId) meta.projectId = dbCtx.projectId;
             if (!meta.leadName && dbCtx.leadName) meta.leadName = dbCtx.leadName;
+            if (!meta.leadId && dbCtx.leadId) meta.leadId = dbCtx.leadId;
             if (dbCtx.mirrorSpokenLanguage) meta.mirrorSpokenLanguage = true;
             if (dbCtx.openerTtsLocale) meta.openerTtsLocale = dbCtx.openerTtsLocale;
             logger.info('[tataStream] Enriched from DB', {
@@ -931,6 +934,7 @@ function handleTataConnection(ws, req) {
           setTimeout(async () => {
             if (session.closed) return;
             try {
+              await voiceContextSeed.seedBeforeFirstAudio(session);
               const sentences = splitIntoSentences(session.openerText);
               logger.info('[tataStream] Sending opener TTS (sentence-streamed)', {
                 streamSid,
@@ -973,12 +977,15 @@ function handleTataConnection(ws, req) {
         // Ignore first ~800ms — line noise; longer window dropped early caller speech
         if (session._mediaFrameCount <= STARTUP_FRAMES_TO_SKIP) break;
 
-        if (session.botSpeaking) {
+        if (session.botSpeaking && session.bargeInEnabled !== false) {
           const energy = computeEnergy(Buffer.from(payload, 'base64'));
-          if (energy > SILENCE_THRESHOLD * 1.65) {
+          const bargeThreshold =
+            (session.vadEnergyThreshold || SILENCE_THRESHOLD) * (session.bargeInEnergyMultiplier || 1.65);
+          const bargeFrames = session.bargeInFramesNeeded || 4;
+          if (energy > bargeThreshold) {
             if (!session._bargeInFrames) session._bargeInFrames = 0;
             session._bargeInFrames++;
-            if (session._bargeInFrames >= 4) {
+            if (session._bargeInFrames >= bargeFrames) {
               logger.info('[tataStream] Barge-in detected — stopping bot speech', {
                 streamSid: session.streamSid,
                 energy: Math.round(energy),
@@ -1014,7 +1021,8 @@ function handleTataConnection(ws, req) {
           });
         }
 
-        if (energy > SILENCE_THRESHOLD) {
+        const speechThreshold = session.vadEnergyThreshold || SILENCE_THRESHOLD;
+        if (energy > speechThreshold) {
           if (session.processing) {
             clearTataAudio(session);
             session.processing = false;
@@ -1035,7 +1043,7 @@ function handleTataConnection(ws, req) {
           session.audioBuffer.push(audioBuf);
           session.totalBufferedBytes += audioBuf.length;
 
-          if (session.silenceFrameCount >= SILENCE_FRAMES_NEEDED) {
+          if (session.silenceFrameCount >= (session.vadSilenceFramesNeeded || SILENCE_FRAMES_NEEDED)) {
             logger.info('[tataStream] Human paused — processing utterance', {
               streamSid: session.streamSid,
               bufferedBytes: session.totalBufferedBytes,
@@ -1234,7 +1242,7 @@ async function loadSessionContext(conversationId) {
   if (!conversationId) return null;
   try {
     const { rows } = await db.query(
-      `SELECT conversation_id, org_id, user_id, locale, contact_name, metadata FROM ai_voice_sessions WHERE conversation_id = $1`,
+      `SELECT conversation_id, org_id, user_id, lead_id, locale, contact_name, metadata FROM ai_voice_sessions WHERE conversation_id = $1`,
       [conversationId]
     );
     if (!rows[0]) return null;
@@ -1254,6 +1262,7 @@ async function loadSessionContext(conversationId) {
       conversationId: row.conversation_id,
       orgId: row.org_id,
       userId: row.user_id,
+      leadId: row.lead_id || null,
       locale: row.locale || 'hing',
       mirrorSpokenLanguage,
       openerTtsLocale,

@@ -35,6 +35,8 @@ router.post(
   ctrl.voiceTts
 );
 router.post('/voice/stt', voiceTtsLimiter, voiceSttUpload.single('audio'), ctrl.voiceSttTranscribe);
+router.get('/voice/stack-profiles', aiLimiter, ctrl.listVoiceStackProfilesHandler);
+router.get('/voice/stack-profiles/:profileId/artifacts', aiLimiter, ctrl.getVoiceStackProfileArtifacts);
 router.post(
   '/voice/session/start',
   aiLimiter,

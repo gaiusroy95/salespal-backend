@@ -1,12 +1,13 @@
 const jwt = require('jsonwebtoken');
 const env = require('../config/env');
+const db = require('../config/db');
 
 /**
  * JWT authentication middleware.
  * Extracts and verifies the access token from Authorization: Bearer <token>.
  * Sets req.user = { id, email, role } on success.
  */
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   // Browsers send OPTIONS preflight without Authorization; must not 401 before CORS completes.
   if (req.method === 'OPTIONS') {
     return next();
@@ -32,6 +33,16 @@ function authMiddleware(req, res, next) {
       email: decoded.email,
       role: decoded.role,
     };
+    // Always use current DB role so promoted admins need not re-login for bypasses.
+    try {
+      const { rows } = await db.query(`SELECT email, role FROM users WHERE id = $1 LIMIT 1`, [decoded.sub]);
+      if (rows[0]) {
+        req.user.email = rows[0].email || req.user.email;
+        req.user.role = rows[0].role || req.user.role;
+      }
+    } catch {
+      /* keep JWT claims if DB lookup fails */
+    }
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -55,7 +66,7 @@ function authMiddleware(req, res, next) {
  * Optional auth middleware — sets req.user if token is present but does not
  * block the request if absent.
  */
-function optionalAuth(req, res, next) {
+async function optionalAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     req.user = null;
@@ -66,6 +77,15 @@ function optionalAuth(req, res, next) {
   try {
     const decoded = jwt.verify(token, env.jwt.accessSecret);
     req.user = { id: decoded.sub, email: decoded.email, role: decoded.role };
+    try {
+      const { rows } = await db.query(`SELECT email, role FROM users WHERE id = $1 LIMIT 1`, [decoded.sub]);
+      if (rows[0]) {
+        req.user.email = rows[0].email || req.user.email;
+        req.user.role = rows[0].role || req.user.role;
+      }
+    } catch {
+      /* keep JWT claims */
+    }
   } catch {
     req.user = null;
   }

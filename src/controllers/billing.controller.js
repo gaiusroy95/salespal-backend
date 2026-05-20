@@ -60,6 +60,11 @@ async function resumeSubscription(req, res, next) {
 
 async function getCredits(req, res, next) {
   try {
+    if (req.user?.role === 'admin') {
+      const orgId = await getOrgId(req.user.id);
+      const balance = orgId ? await billingService.getCreditBalance(orgId) : 0;
+      return res.json({ balance: Math.max(balance, 999999), bypassed: true, reason: 'admin_credit_bypass' });
+    }
     const orgId = await getOrgId(req.user.id);
     if (!orgId) return res.json({ balance: 0 });
     const balance = await billingService.getCreditBalance(orgId);
@@ -71,6 +76,11 @@ async function getCredits(req, res, next) {
 
 async function consumeCredit(req, res, next) {
   try {
+    if (req.user?.role === 'admin') {
+      const orgId = await getOrgId(req.user.id);
+      const balance = orgId ? await billingService.getCreditBalance(orgId) : 0;
+      return res.json({ success: true, balance, bypassed: true, reason: 'admin_credit_bypass' });
+    }
     const orgId = await getOrgId(req.user.id);
     if (!orgId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No organization found' } });
 

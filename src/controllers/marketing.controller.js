@@ -33,8 +33,46 @@ function isVertexQuotaErrorMessage(message) {
     msg.includes('resource_exhausted') ||
     msg.includes('429') ||
     msg.includes('too many requests') ||
-    msg.includes('quotas-genai')
+    msg.includes('quotas-genai') ||
+    msg.includes('compute time') ||
+    (msg.includes('exceeded') && msg.includes('limit')) ||
+    (msg.includes('billing') && msg.includes('disabled'))
   );
+}
+
+/** SVG data-URL placeholder so admins can preview the wizard without Vertex Imagen quota. */
+function adminAdImagePlaceholder() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect fill="#0f172a" width="512" height="512"/><text x="256" y="232" fill="#e2e8f0" font-family="system-ui,sans-serif" font-size="20" text-anchor="middle">Admin preview</text><text x="256" y="268" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="14" text-anchor="middle">No image quota used</text></svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+/** Minimal ad copy when Gemini fails and user is admin (avoids blocking dev / internal accounts). */
+function buildAdminStubAdCampaigns(businessContext, platforms) {
+  const selected = Array.isArray(platforms) && platforms.length ? platforms : ['google', 'meta'];
+  const overview = String(businessContext.businessOverview || 'Your brand').slice(0, 120);
+  const campaigns = [];
+  for (const rawPlat of selected) {
+    const pl = String(rawPlat || '').toLowerCase();
+    let platformLabel = 'Meta Ads';
+    if (pl.includes('google')) platformLabel = 'Google Ads';
+    else if (pl.includes('linkedin')) platformLabel = 'LinkedIn Ads';
+    else if (pl.includes('instagram')) platformLabel = 'Instagram Ads';
+    campaigns.push({
+      platform: platformLabel,
+      campaignName: `${overview || 'Campaign'} — ${platformLabel}`,
+      goal: 'Awareness',
+      headlines: ['Discover today', 'Trusted quality', 'Shop the range', 'Learn more', 'Get started'],
+      descriptions: ['Explore what we offer.', 'Tap to see details tailored for you.'],
+      primaryText: overview || 'Explore our products and services.',
+      cta: 'Learn More',
+      targeting: {
+        audience: 'General',
+        interests: ['Business'],
+        keywords: ['brand', 'offers', 'shop'],
+      },
+    });
+  }
+  return { campaigns };
 }
 
 async function generateVertexAdImageWithRetry(prompt, aspectRatio, attemptCount = 3) {
@@ -582,21 +620,41 @@ async function analyzeBusiness(req, res, next) {
 
     let rawResult;
     try {
+      // Admins: do not call Gemini for business analysis — avoids org-wide API quota
+      // blocking internal/dev accounts; scraped metadata is still merged below.
+      if (req.user?.role === 'admin') {
+        const skip = new Error('admin_bypass_skip_gemini');
+        skip.code = 'ADMIN_SKIP_GEMINI';
+        throw skip;
+      }
       rawResult = await generateBusinessAnalysis(inputText);
       console.log('STEP 4: Raw Gemini response keys:', Object.keys(rawResult || {}));
     } catch (aiErr) {
-      console.error('STEP 4 ERROR: Gemini failed:', aiErr.message);
+      const adminBypass = aiErr?.code === 'ADMIN_SKIP_GEMINI';
+      if (adminBypass) {
+        console.log('STEP 3-4: Admin user — skipped Gemini business analysis (quota waived for development).');
+      } else {
+        console.error('STEP 4 ERROR: Gemini failed:', aiErr.message);
+      }
       const aiErrMsg = String(aiErr?.message || '');
       const noProviderConfigured =
         aiErrMsg.includes('No AI provider configured') ||
         aiErrMsg.includes('missing GOOGLE_GENERATIVE_AI_API_KEY') ||
         aiErrMsg.includes('unconfigured');
-      const aiFallbackReason = noProviderConfigured ? 'ai_not_configured' : 'ai_runtime_failure';
+      const aiFallbackReason = adminBypass
+        ? 'admin_usage_bypass'
+        : noProviderConfigured
+          ? 'ai_not_configured'
+          : 'ai_runtime_failure';
       // Return comprehensive fallback data so the frontend never gets empty
       rawResult = {
         error: true,
         fallbackReason: aiFallbackReason,
-        businessSummary: description || 'AI-generated summary unavailable. Showing inferred data based on website metadata.',
+        businessSummary:
+          description ||
+          (adminBypass
+            ? 'Administrator preview — AI summary skipped to avoid provider quota. Website/PDF signals are merged when available.'
+            : 'AI-generated summary unavailable. Showing inferred data based on website metadata.'),
         tags: ['Business', 'Online', 'Global'],
         brandPersonality: {
           archetype: 'Professional',
@@ -672,10 +730,16 @@ async function analyzeBusiness(req, res, next) {
           industry: 'Business',
           targetMarket: 'Global'
         },
-        noticeTitle: noProviderConfigured ? 'AI key not configured' : 'Partial analysis recovered',
-        noticeMessage: noProviderConfigured
-          ? 'Your backend Gemini key is missing, so we generated a safe inferred brief from website/PDF metadata. Add GOOGLE_GENERATIVE_AI_API_KEY for full AI analysis.'
-          : 'Live AI analysis partially failed. We generated a safe inferred brief from available website/PDF metadata so you can continue.'
+        noticeTitle: adminBypass
+          ? 'Admin preview (no Gemini usage)'
+          : noProviderConfigured
+            ? 'AI key not configured'
+            : 'Partial analysis recovered',
+        noticeMessage: adminBypass
+          ? 'Your administrator account skips cloud AI for this step so development is not blocked by Gemini compute or billing limits. Scraped website/PDF content is still applied where available.'
+          : noProviderConfigured
+            ? 'Your backend Gemini key is missing, so we generated a safe inferred brief from website/PDF metadata. Add GOOGLE_GENERATIVE_AI_API_KEY for full AI analysis.'
+            : 'Live AI analysis partially failed. We generated a safe inferred brief from available website/PDF metadata so you can continue.'
       };
     }
 
@@ -807,6 +871,7 @@ async function generateAds(req, res) {
       selectedAdFormat === 'carousel' || selectedAdFormat === 'video' ? carouselSlides : numberOfImages;
 
     const orgId = await getOrgId(req.user.id);
+    const isAdminUser = req.user?.role === 'admin';
     console.log(`[generateAds] images=${numberOfImages} format=${selectedAdFormat} slideCount=${slideCount}`);
 
     console.log('[generateAds] Request received', {
@@ -883,7 +948,7 @@ async function generateAds(req, res) {
       },
     };
 
-    if (!env.GCP_PROJECT_ID) {
+    if (!env.GCP_PROJECT_ID && !isAdminUser) {
       return res.status(400).json({
         success: false,
         error: {
@@ -894,11 +959,18 @@ async function generateAds(req, res) {
     }
 
     console.log('[generateAds] Generating ad copy via Gemini...');
-    const result = await withTimeout(
-      generateAdCampaigns(businessContext),
-      45000,
-      'generateAdCampaigns'
-    );
+    let result;
+    try {
+      result = await withTimeout(
+        generateAdCampaigns(businessContext),
+        45000,
+        'generateAdCampaigns'
+      );
+    } catch (copyErr) {
+      if (!isAdminUser) throw copyErr;
+      console.warn('[generateAds] Admin bypass: Gemini ad copy failed, using stub campaigns.', copyErr?.message || copyErr);
+      result = buildAdminStubAdCampaigns(businessContext, platforms);
+    }
     console.log('[generateAds] AI returned', result?.campaigns?.length, 'campaigns');
 
     // === OPENAI IMAGE GENERATION PIPELINE ===
@@ -952,7 +1024,6 @@ async function generateAds(req, res) {
         return slideCount;
       });
       const previewCredits = Math.max(1, slidesPerCampaign.reduce((a, b) => a + b, 0));
-      const isAdminUser = req.user?.role === 'admin';
       if (orgId && !isAdminUser) {
         const ok = await creditService.consumeCredits(
           orgId,
@@ -1028,7 +1099,12 @@ async function generateAds(req, res) {
         }
 
         const images = [];
+        const adminPlaceholder = adminAdImagePlaceholder();
         for (let i = 0; i < countForCampaign; i++) {
+          if (isAdminUser && !env.GCP_PROJECT_ID) {
+            images.push(adminPlaceholder);
+            continue;
+          }
           console.log(`[generateAds]   Slide ${i + 1}/${countForCampaign}...`);
           let currentPrompt = prompts[i % prompts.length];
           if (parsedCustomScript && typeof parsedCustomScript === 'object') {
@@ -1046,6 +1122,13 @@ async function generateAds(req, res) {
             images.push(img);
           } catch (e) {
             const msg = String(e?.message || e || '');
+            if (isAdminUser) {
+              console.warn(
+                `[generateAds] Admin bypass: skipping Vertex slide ${i + 1} for "${campaign.campaignName}": ${msg.slice(0, 200)}`
+              );
+              images.push(adminPlaceholder);
+              continue;
+            }
             const isQuota = isVertexQuotaErrorMessage(msg);
             const err = new Error(
               isQuota
@@ -1154,6 +1237,37 @@ async function generateAds(req, res) {
 
   } catch (error) {
     console.error('[generateAds] Error:', error.message);
+    if (req.user?.role === 'admin') {
+      const analysisData = req.body?.analysisData || {};
+      const platforms = req.body?.platforms;
+      const businessContext = {
+        businessOverview: analysisData?.businessSummary || 'General business',
+        industry: analysisData?.businessSignals?.industry || 'Business',
+      };
+      const stub = buildAdminStubAdCampaigns(businessContext, platforms);
+      const ph = adminAdImagePlaceholder();
+      const selectedAdFormat = String(req.body?.selectedAdFormat || 'image').toLowerCase();
+      const connectTarget = String(req.body?.connectTarget || 'none').trim().toLowerCase();
+      for (const campaign of stub.campaigns) {
+        campaign.image = ph;
+        campaign.images = [ph];
+        campaign.carouselImages = [ph];
+        campaign.title = campaign.campaignName;
+        campaign.description = campaign.primaryText || campaign.descriptions?.[0] || '';
+        campaign.generatedAdFormat = selectedAdFormat;
+        campaign.videoFromSlides = selectedAdFormat === 'video';
+        campaign.connectTarget = connectTarget;
+      }
+      return res.json({
+        success: true,
+        data: stub,
+        warning: {
+          code: 'ADMIN_ADS_FALLBACK',
+          message:
+            'Administrator account: returned placeholder creatives because ad generation failed (often Gemini/Vertex quota). Usage fees are not applied.',
+        },
+      });
+    }
     const statusCode = error?.code === 'VERTEX_IMAGEN_QUOTA' ? 429 : 502;
 
     return res.status(statusCode).json({

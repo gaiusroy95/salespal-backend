@@ -12,6 +12,7 @@ const callComplianceService = require('../services/callCompliance.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 const { parseNaturalScheduleUtcIso } = require('../utils/leadScheduleTz');
 const { resolveLocaleFromDialCode } = require('../utils/voiceLocaleResolver');
+const { isPlatformAdmin } = require('../utils/adminBypass');
 
 const HARD_BLOCK_PATTERNS = [
   /\b(stop|do not call|don't call|unsubscribe|opt[-\s]?out)\b/i,
@@ -277,6 +278,36 @@ async function runVoiceCatalogueWhatsAppRelay({ session, orgId, userId, projectI
   }
 }
 
+/** Local stub for platform admins — avoids Gemini compute quota during development. */
+function adminChatStubResponse(message, context) {
+  const userMsg = String(message || '').trim();
+  if (context === 'whatsapp') {
+    return `Hi there — thanks for your message. Our team will share project details and next steps here on WhatsApp shortly.\n\n(Admin preview: cloud AI skipped to preserve API quota.)`;
+  }
+  if (/script|calling|opener|qualif/i.test(userMsg)) {
+    return `## Opener
+Hello, this is your sales advisor calling — do you have a minute to discuss your requirements?
+
+## Qualifying questions
+- What are you looking for right now?
+- What timeline works for you?
+- What budget range are you considering?
+
+## Pitch
+We help customers find the right fit with clear pricing and flexible next steps.
+
+## Objection handling
+1. **Objection:** Not interested right now
+   **Reply:** I understand — may I send a short summary on WhatsApp and call back at a better time?
+
+## Closing CTA
+Confirm the best callback time or site visit, and send a WhatsApp recap.
+
+(Admin preview: Gemini was not invoked for this request.)`;
+  }
+  return `Thanks for your message. Administrator mode is active — this reply is a local preview stub so Gemini compute quota is not consumed.\n\nYour prompt was received (${userMsg.length} characters). Configure GOOGLE_GENERATIVE_AI_API_KEY for full AI replies on non-admin accounts.`;
+}
+
 /**
  * General AI chat endpoint.
  */
@@ -284,6 +315,15 @@ async function chat(req, res, next) {
   try {
     const { message, context, history, leadPreferredLocale, leadTimezone, projectId } = req.body;
     if (!message) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'message is required' } });
+
+    if (isPlatformAdmin(req.user)) {
+      return res.json({
+        response: adminChatStubResponse(message, context),
+        fallback: true,
+        reason: 'admin_usage_bypass',
+        reason_message: 'Platform admin: cloud AI skipped',
+      });
+    }
 
     try {
       let systemPrompt = aiService.systemPromptForChat(context, {

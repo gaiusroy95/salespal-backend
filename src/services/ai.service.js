@@ -198,7 +198,14 @@ function classifyGeminiError(err) {
     out.userMessage = 'Gemini permission denied. Verify project permissions and API access.';
     return out;
   }
-  if (msg.includes('quota') || msg.includes('rate') || msg.includes('429') || msg.includes('resource_exhausted')) {
+  if (
+    msg.includes('quota') ||
+    msg.includes('rate') ||
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('compute time') ||
+    (msg.includes('exceeded') && msg.includes('limit'))
+  ) {
     out.code = 'AI_GEMINI_QUOTA_EXCEEDED';
     out.statusCode = 429;
     out.userMessage = 'Gemini quota/rate limit reached. Retry later or increase quota.';

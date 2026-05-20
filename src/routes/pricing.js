@@ -1,8 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { getProductPrice } = require('../services/pricingService');
 const logger = require('../config/logger');
 const db = require('../config/db');
+const {
+  DEFAULT_PUBLIC_PRICING,
+  DEFAULT_MODULE_ACCESS,
+  parseSettingsValue,
+} = require('../utils/publicApiFallbacks');
 
 /**
  * GET /api/pricing
@@ -19,9 +23,9 @@ router.get('/', async (req, res, next) => {
 
     let allPricing = {};
     let platformConfig = {};
-    result.rows.forEach(row => {
-      if (row.key === 'module_pricing') allPricing = row.value || {};
-      if (row.key === 'platform_config') platformConfig = row.value || {};
+    result.rows.forEach((row) => {
+      if (row.key === 'module_pricing') allPricing = parseSettingsValue(row.value);
+      if (row.key === 'platform_config') platformConfig = parseSettingsValue(row.value);
     });
 
     const moduleAccess = platformConfig.modules || {
@@ -51,16 +55,24 @@ router.get('/', async (req, res, next) => {
         yearlyPrice: Number(data.yearly) || 0,
       }));
 
-    logger.info(`[Pricing API] Served ${pricing.length} module pricing entries. Maintenance: ${maintenanceMode}`);
+    const pricingOut = pricing.length ? pricing : DEFAULT_PUBLIC_PRICING;
 
-    return res.json({ 
-      pricing, 
+    logger.info(`[Pricing API] Served ${pricingOut.length} module pricing entries. Maintenance: ${maintenanceMode}`);
+
+    return res.json({
+      pricing: pricingOut,
       modules: moduleAccess,
-      maintenanceMode
+      maintenanceMode,
+      degraded: !pricing.length,
     });
   } catch (err) {
     logger.error(`[Pricing API] Failed to fetch pricing: ${err.message}`);
-    next(err);
+    return res.json({
+      pricing: DEFAULT_PUBLIC_PRICING,
+      modules: DEFAULT_MODULE_ACCESS,
+      maintenanceMode: false,
+      degraded: true,
+    });
   }
 });
 

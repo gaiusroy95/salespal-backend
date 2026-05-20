@@ -1,5 +1,6 @@
 const env = require('../config/env');
 const logger = require('../config/logger');
+const { sanitizeAuthErrorMessage } = require('../utils/publicApiFallbacks');
 
 /**
  * Global error handler middleware.
@@ -28,11 +29,16 @@ function errorHandler(err, req, res, _next) {
     });
   }
 
+  let message = err.message || 'An unexpected error occurred';
+  if (String(req.originalUrl || '').startsWith('/auth')) {
+    message = sanitizeAuthErrorMessage(message);
+  }
+
   // Build response
   const response = {
     error: {
       code,
-      message: err.message || 'An unexpected error occurred',
+      message,
     },
   };
 

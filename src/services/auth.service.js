@@ -161,6 +161,15 @@ async function loginUser({ email, password }) {
     throw err;
   }
 
+  if (!user.password_hash) {
+    const err = new Error(
+      'This account uses Google sign-in. Please use "Sign in with Google" or reset your password.'
+    );
+    err.statusCode = 401;
+    err.code = 'UNAUTHORIZED';
+    throw err;
+  }
+
   const valid = await comparePassword(password, user.password_hash);
   if (!valid) {
     const err = new Error('Invalid email or password');

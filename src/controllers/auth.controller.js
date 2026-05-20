@@ -1,4 +1,20 @@
 const authService = require('../services/auth.service');
+const logger = require('../config/logger');
+const { sanitizeAuthErrorMessage } = require('../utils/publicApiFallbacks');
+
+function forwardAuthError(err, res, next) {
+  if (err?.statusCode && err.statusCode < 500) {
+    return next(err);
+  }
+  logger.error('[auth] unexpected failure', { message: err?.message || err, code: err?.code });
+  const safeMessage = sanitizeAuthErrorMessage(err?.message);
+  return res.status(err?.statusCode && err.statusCode < 500 ? err.statusCode : 503).json({
+    error: {
+      code: err?.code || 'AUTH_UNAVAILABLE',
+      message: safeMessage,
+    },
+  });
+}
 
 async function register(req, res, next) {
   try {
@@ -7,7 +23,7 @@ async function register(req, res, next) {
 
     res.status(201).json(result);
   } catch (err) {
-    next(err);
+    return forwardAuthError(err, res, next);
   }
 }
 
@@ -22,7 +38,11 @@ async function login(req, res, next) {
       refreshToken: result.refreshToken,
     });
   } catch (err) {
-    next(err);
+    if (err?.statusCode && err.statusCode < 500) {
+      err.message = sanitizeAuthErrorMessage(err.message);
+      return next(err);
+    }
+    return forwardAuthError(err, res, next);
   }
 }
 
@@ -66,17 +86,20 @@ async function logout(req, res, next) {
 }
 
 const googleLogin = async (req, res, next) => {
-    try {
-        const { token } = req.body;
-        if (!token) {
-            return res.status(400).json({ message: 'Google token is required' });
-        }
-        
-        const result = await authService.googleLogin(token);
-        res.json(result);
-    } catch (err) {
-        next(err);
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ message: 'Google token is required' });
     }
+
+    const result = await authService.googleLogin(token);
+    res.json(result);
+  } catch (err) {
+    if (err?.statusCode && err.statusCode < 500) {
+      return next(err);
+    }
+    return forwardAuthError(err, res, next);
+  }
 };
 
 async function verify(req, res, next) {

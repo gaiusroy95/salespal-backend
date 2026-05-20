@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const logger = require('../config/logger');
+const { DEFAULT_MAINTENANCE, parseSettingsValue } = require('../utils/publicApiFallbacks');
 
 /**
  * GET /api/maintenance/status
@@ -16,7 +17,7 @@ router.get('/status', async (req, res, next) => {
       "SELECT value FROM platform_settings WHERE key = 'platform_config'"
     );
 
-    const config = result.rows[0]?.value || {};
+    const config = parseSettingsValue(result.rows[0]?.value);
 
     // Build a clean maintenance response
     const maintenance = config.maintenance || {
@@ -42,7 +43,7 @@ router.get('/status', async (req, res, next) => {
     res.json({ maintenance });
   } catch (err) {
     logger.error(`[Maintenance API] Failed to fetch status: ${err.message}`);
-    next(err);
+    return res.json({ maintenance: DEFAULT_MAINTENANCE, degraded: true });
   }
 });
 

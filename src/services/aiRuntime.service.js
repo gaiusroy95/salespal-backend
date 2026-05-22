@@ -5,7 +5,12 @@ const aiService = require('./ai.service');
 const tataVoiceService = require('./tataVoice.service');
 const sarvamService = require('./sarvam.service');
 const { generatePromotionalVideo } = require('./aiVideo.service');
-const { retrieveTopK, retrieveTopKSql, embedSingleText } = require('./projectKnowledge.service');
+const {
+  retrieveTopKFromRows,
+  retrieveTopKSql,
+  embedSingleText,
+} = require('./projectKnowledge.service');
+const logger = require('../config/logger');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 const salesEngagement = require('./salesEngagement.service');
 const voiceContextSeed = require('./voiceContextSeed.service');
@@ -566,7 +571,7 @@ function hostnameVariantsForMatch(urlLike) {
  * Prefer rows whose source_name/content explicitly mention the user's URL/domain,
  * then fill with semantic retrieveTopK. Deduped; capped.
  */
-function mergeKnowledgeSemanticAndUrlRows(rows, queryText, semanticK = 8, maxTotal = 14) {
+async function mergeKnowledgeSemanticAndUrlRows(rows, queryText, semanticK = 8, maxTotal = 14) {
   const list = rows || [];
   const q = String(queryText || '').trim();
   const urls = extractUrlsFromUtterance(q);
@@ -577,7 +582,8 @@ function mergeKnowledgeSemanticAndUrlRows(rows, queryText, semanticK = 8, maxTot
     hostnameVariantsForMatch(u).forEach((h) => needleSet.add(h));
   }
 
-  let semantic = retrieveTopK(urls.length ? `${urls.slice(0, 3).join(' ')}\n${q}` : q || 'project overview', list, semanticK);
+  const semanticQuery = urls.length ? `${urls.slice(0, 3).join(' ')}\n${q}` : q || 'project overview';
+  let semantic = await retrieveTopKFromRows(semanticQuery, list, semanticK);
 
   const urlHits = [];
   if (needleSet.size) {
@@ -672,7 +678,7 @@ async function fetchProjectKnowledgeContext({ projectId, queryText, leadId, user
     [kbOrgId, projectId]
   );
   if (!rows.length) return [];
-  return mergeKnowledgeSemanticAndUrlRows(rows, queryText, 10, 18);
+  return await mergeKnowledgeSemanticAndUrlRows(rows, queryText, 10, 18);
 }
 
 async function fetchProjectRecordForVoice({ orgId, projectId }) {
@@ -749,9 +755,20 @@ async function resolveBrainDriveOrgForVoice({ projectId, leadId, userId }) {
     String(lead.user_id) === String(userId);
 
   if (!(sameOrg || tagged || callerOwnsLead)) {
-    console.warn('[aiRuntime] Brain Drive org gate: lead/project mismatch', {
+    if (userId && projOrg) {
+      const { rows: memberRows } = await db.query(
+        `SELECT 1 FROM org_members WHERE user_id = $1 AND org_id = $2 LIMIT 1`,
+        [userId, projOrg]
+      );
+      if (memberRows[0]) {
+        return { knowledgeOrgId: project.org_id, project };
+      }
+    }
+    logger.warn('[aiRuntime] Brain Drive org gate: lead/project mismatch', {
       leadId,
       projectId,
+      leadOrg,
+      projOrg,
     });
     return null;
   }
@@ -783,46 +800,66 @@ async function buildVoiceProjectDiscussionBrief({ orgId: _fallbackOrgId, project
   if (industry) lines.push(`Industry: ${industry}`);
   if (desc) lines.push(`Description: ${desc}`);
 
-  const knowledgeRows = await fetchAllProjectKnowledgeRows({ orgId: knowledgeOrgId, projectId });
-  if (!knowledgeRows.length) {
-    return {
-      brief: lines.join('\n'),
-      displayName: pname,
-      hasKnowledge: false,
-    };
-  }
-
   const seedQueries = [
     `${pname} overview introduction marketing pitch`,
     `${pname} pricing payment plan EMI booking possession`,
     `${pname} location connectivity amenities RERA legal inventory`,
-    `site visit brochure floor plan plots units`,
+    `${pname} site visit brochure floor plan plots units BHK`,
   ];
   const chunks = [];
   const seen = new Set();
+  const pushHit = (r) => {
+    const key = `${r.source_type}|${String(r.source_name || '').slice(0, 320)}|${String(r.content || '').slice(0, 160)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (String(r.content || '').trim()) chunks.push(r);
+  };
+
   for (const qs of seedQueries) {
-    for (const r of retrieveTopK(qs, knowledgeRows, 5)) {
-      const key = `${r.source_name || ''}:${String(r.content || '').slice(0, 140)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      chunks.push(r);
-      if (chunks.length >= 16) break;
+    try {
+      const hits = await retrieveTopKSql({
+        projectId,
+        orgId: knowledgeOrgId,
+        queryText: qs,
+        k: 6,
+      });
+      for (const r of hits) pushHit(r);
+    } catch (e) {
+      logger.warn('[aiRuntime] Brain Drive seed query failed', { query: qs.slice(0, 80), error: e.message });
     }
-    if (chunks.length >= 16) break;
+    if (chunks.length >= 18) break;
   }
 
-  const materialLines = chunks.map((r) => {
-    const content = String(r.content || '').trim();
-    return content;
-  });
-  lines.push('');
-  lines.push('Project knowledge:');
-  lines.push(materialLines.join('\n---\n'));
+  if (!chunks.length) {
+    const knowledgeRows = await fetchAllProjectKnowledgeRows({ orgId: knowledgeOrgId, projectId });
+    for (const qs of seedQueries) {
+      const hits = await retrieveTopKFromRows(qs, knowledgeRows, 5);
+      for (const r of hits) pushHit(r);
+      if (chunks.length >= 18) break;
+    }
+  }
+
+  const materialLines = chunks.map((r) => String(r.content || '').trim()).filter(Boolean);
+  if (materialLines.length) {
+    lines.push('');
+    lines.push('Project knowledge (from Brain Drive — ground truth for this call):');
+    lines.push(materialLines.join('\n---\n'));
+  }
+
+  const hasKnowledge = materialLines.length > 0;
+  if (!hasKnowledge) {
+    logger.warn('[aiRuntime] Brain Drive brief empty', { projectId, knowledgeOrgId, projectName: pname });
+  } else {
+    logger.info('[aiRuntime] Brain Drive brief built', {
+      projectId,
+      chunkCount: materialLines.length,
+    });
+  }
 
   return {
     brief: lines.join('\n').slice(0, 6200),
     displayName: pname,
-    hasKnowledge: chunks.length > 0,
+    hasKnowledge,
   };
 }
 
@@ -1014,6 +1051,26 @@ async function createVoiceSession({
     `INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`,
     [conversationId, opener]
   );
+
+  if (leadId && projectId) {
+    try {
+      await db.query(
+        `UPDATE leads
+         SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [
+          leadId,
+          JSON.stringify({
+            projectId,
+            ...(voiceProjectName ? { projectName: voiceProjectName } : {}),
+          }),
+        ]
+      );
+    } catch (e) {
+      console.warn('[aiRuntime] Lead projectId sync skipped:', e.message);
+    }
+  }
 
   if (leadId && orgId) {
     try {
@@ -1241,6 +1298,14 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
     leadId: row.lead_id || null,
     userId: knowledgeUserId,
   });
+  if (projectId) {
+    logger.info('[aiRuntime] Brain Drive turn retrieval', {
+      conversationId,
+      projectId,
+      evidenceCount: topKnowledge.length,
+      hasBrief: Boolean(voiceProjectBrief),
+    });
+  }
   const asksProjectFacts =
     isProjectFactQuestion(text) || isListingFollowUpUtterance(text, projectId);
 
@@ -1248,10 +1313,16 @@ async function handleVoiceTurn({ conversationId, text, orgId, userId, detectedLo
     ? '\n- **Project-first call:** This session has a selected listing. Anchor on it for brochure, "**the website**", portal/pricing links, towers/phases, RERA visits, timelines, paperwork.\n- If the lead mentions a URL or "**official site**", treat it as a question about this listing and answer from KNOWLEDGE BOUNDARY + baseline only unless they clearly switched topic.\n- Off-topic chatter: acknowledge briefly (spoken style), then steer back.\n- Do not invent listing facts beyond KNOWLEDGE BOUNDARY + baseline.'
     : '';
 
+  const groundingWhenHasRows = topKnowledge.length
+    ? `\n- For pricing, location, size, amenities, possession, RERA, or payment plans: answer ONLY from PROJECT KNOWLEDGE BOUNDARY and PROJECT FACTS. Quote specific details naturally in spoken form.\n- Do not invent numbers, tower names, or offers that are not in the boundary.`
+    : projectId
+      ? `\n- Project materials did not load a fact for this exact question — say you will confirm that detail with the team or share it on WhatsApp after the call; do not guess.`
+      : '';
+
   const boundaryWhenHasRows = topKnowledge.length
     ? `\nPROJECT KNOWLEDGE BOUNDARY (PRIMARY FACT SOURCE):\n${topKnowledge
         .map((r) => `[${r.source_type}] ${r.content}`)
-        .join('\n---\n')}\nRules:\n- Use this boundary for project-specific facts (location, pricing, inventory, amenities, legal/process).${pivotWhenProject}\n- Never present general knowledge as project-confirmed fact unless it exists in this boundary.`
+        .join('\n---\n')}\nRules:\n- Use this boundary for project-specific facts (location, pricing, inventory, amenities, legal/process).${pivotWhenProject}${groundingWhenHasRows}\n- Never present general knowledge as project-confirmed fact unless it exists in this boundary.`
     : '';
 
   const boundaryEmptyRules = projectId
@@ -1356,7 +1427,7 @@ SPEECH OUTPUT RULES (your reply will be read aloud by text-to-speech):
 ${aiService.SALES_CONVERSATION_FUNNEL_BLOCK}
 ${aiService.humanStyleConsistencyBlock(voiceStylePersona)}`;
 
-  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.4, maxTokens: 240 });
+  const reply = await aiService.callAIWithMessages(chatMessages, voiceSystem, { temperature: 0.38, maxTokens: 320 });
 
   await db.query(`INSERT INTO ai_voice_turns (conversation_id, role, content) VALUES ($1, 'assistant', $2)`, [
     conversationId,

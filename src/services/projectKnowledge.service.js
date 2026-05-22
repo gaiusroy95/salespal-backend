@@ -315,10 +315,45 @@ function cosine(a, b) {
 
 function retrieveTopK(query, rows, k = 6) {
   const q = hashEmbedFallback(query);
+  return retrieveTopKWithQueryVector(q, rows, k);
+}
+
+function retrieveTopKWithQueryVector(qVec, rows, k = 6) {
   return (rows || [])
-    .map((r) => ({ ...r, score: cosine(q, Array.isArray(r.embedding) ? r.embedding : []) }))
+    .map((r) => {
+      const emb = Array.isArray(r.embedding) ? r.embedding : [];
+      return { ...r, score: cosine(qVec, emb) };
+    })
     .sort((a, b) => b.score - a.score)
     .slice(0, k);
+}
+
+/** Semantic search over in-memory rows (uses Gemini query embedding when configured). */
+async function retrieveTopKFromRows(query, rows, k = 6) {
+  const list = rows || [];
+  if (!list.length) return [];
+  const q = String(query || '').trim() || 'project overview';
+  try {
+    const qVec = await embedSingleText(q, 'RETRIEVAL_QUERY');
+    const isRealEmbedding = qVec.filter((v) => v !== 0).length > 20;
+    if (isRealEmbedding) {
+      return retrieveTopKWithQueryVector(qVec, list, k);
+    }
+  } catch (err) {
+    logger.debug('[knowledge] retrieveTopKFromRows embed failed', { error: err.message });
+  }
+  return retrieveTopK(q, list, k);
+}
+
+/** Brain Drive rows are stored under projects.org_id — not always the lead's org_id. */
+async function resolveKnowledgeOrgId(projectId, fallbackOrgId = null) {
+  if (!projectId) return fallbackOrgId || null;
+  try {
+    const { rows } = await db.query(`SELECT org_id FROM projects WHERE id = $1 LIMIT 1`, [projectId]);
+    return rows[0]?.org_id || fallbackOrgId || null;
+  } catch {
+    return fallbackOrgId || null;
+  }
 }
 
 // ─── Re-index ─────────────────────────────────────────────────────────────
@@ -369,7 +404,9 @@ module.exports = {
   extractWebpageKnowledge,
   buildKnowledgeRows,
   retrieveTopK,
+  retrieveTopKFromRows,
   retrieveTopKSql,
+  resolveKnowledgeOrgId,
   embedSingleText,
   embedTexts,
   reindexProjectEmbeddings,

@@ -587,6 +587,9 @@ async function processUtterance(session) {
       streamSid: session.streamSid,
       reply: reply.slice(0, 200),
       aiMs,
+      factSource: turnResult?.factSource?.type,
+      evidenceCount: turnResult?.factSource?.evidenceCount ?? 0,
+      projectId: session.projectId || null,
     });
 
     const sentences = splitIntoSentences(reply);

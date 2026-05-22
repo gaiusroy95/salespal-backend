@@ -8,7 +8,7 @@ const whatsappService = require('../services/whatsapp.service');
 const callComplianceService = require('../services/callCompliance.service');
 const tataVoiceService = require('../services/tataVoice.service');
 const salesEngagement = require('../services/salesEngagement.service');
-const { retrieveTopKSql } = require('../services/projectKnowledge.service');
+const { retrieveTopKSql, resolveKnowledgeOrgId } = require('../services/projectKnowledge.service');
 
 async function getOrgId(userId) {
   const { rows } = await db.query(
@@ -705,11 +705,19 @@ async function resolveProjectForLead({ orgId, leadId, leadMetadata }) {
   }
 
   if (projectId) {
-    const { rows } = await db.query(
-      `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
-      [projectId, orgId]
+    const { rows: byId } = await db.query(
+      `SELECT id, name, description, org_id FROM projects WHERE id = $1 LIMIT 1`,
+      [projectId]
     );
-    project = rows[0] || null;
+    if (byId[0]) {
+      project = byId[0];
+    } else {
+      const { rows } = await db.query(
+        `SELECT id, name, description, org_id FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
+        [projectId, orgId]
+      );
+      project = rows[0] || null;
+    }
   }
 
   const hintedNames = [md.projectName, md.project_name, leadCompanyName]
@@ -748,7 +756,8 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadId, leadMetadata, qu
   if (!projectId) return '';
 
   const q = String(queryText || '').trim() || `${project.name || 'project'} overview pricing location`;
-  const top = await retrieveTopKSql({ projectId, orgId, queryText: q, k: 8 });
+  const knowledgeOrgId = (await resolveKnowledgeOrgId(projectId, orgId)) || orgId;
+  const top = await retrieveTopKSql({ projectId, orgId: knowledgeOrgId, queryText: q, k: 10 });
   const contextLines = top
     .map((r) => `[${String(r.source_type || 'source')}] ${String(r.content || '').trim()}`)
     .filter(Boolean)

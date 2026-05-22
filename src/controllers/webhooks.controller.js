@@ -4,7 +4,7 @@ const env = require('../config/env');
 const logger = require('../config/logger');
 const whatsappService = require('../services/whatsapp.service');
 const aiService = require('../services/ai.service');
-const { retrieveTopKSql } = require('../services/projectKnowledge.service');
+const { retrieveTopKSql, resolveKnowledgeOrgId } = require('../services/projectKnowledge.service');
 const { honorificNameJi } = require('../utils/voiceHonorifics');
 const salesEngagement = require('../services/salesEngagement.service');
 
@@ -146,11 +146,19 @@ async function resolveProjectForLead({ orgId, leadMetadata, leadCompanyName }) {
   let project = null;
 
   if (projectId) {
-    const { rows } = await db.query(
-      `SELECT id, name, description FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
-      [projectId, orgId]
+    const { rows: byId } = await db.query(
+      `SELECT id, name, description, org_id FROM projects WHERE id = $1 LIMIT 1`,
+      [projectId]
     );
-    project = rows[0] || null;
+    if (byId[0]) {
+      project = byId[0];
+    } else {
+      const { rows } = await db.query(
+        `SELECT id, name, description, org_id FROM projects WHERE id = $1 AND org_id = $2 LIMIT 1`,
+        [projectId, orgId]
+      );
+      project = rows[0] || null;
+    }
   }
 
   const hintedNames = [
@@ -198,7 +206,8 @@ async function buildLeadProjectKnowledgePrompt({ orgId, leadMetadata, leadCompan
   const md = leadMetadata && typeof leadMetadata === 'object' ? leadMetadata : {};
 
   const q = String(queryText || '').trim() || `${project.name || 'project'} overview pricing location`;
-  const top = await retrieveTopKSql({ projectId, orgId, queryText: q, k: 8 });
+  const knowledgeOrgId = (await resolveKnowledgeOrgId(projectId, orgId)) || orgId;
+  const top = await retrieveTopKSql({ projectId, orgId: knowledgeOrgId, queryText: q, k: 10 });
   const evidence = top
     .map((r) => `[${String(r.source_type || 'source')}] ${String(r.content || '').trim()}`)
     .filter(Boolean)

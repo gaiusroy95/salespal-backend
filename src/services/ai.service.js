@@ -133,6 +133,87 @@ Provide:
 }
 
 /**
+ * Sales campaign report prompt (leads + outreach performance).
+ */
+function buildSalesCampaignReportPrompt(campaign, leadStats) {
+  const md =
+    campaign.metadata && typeof campaign.metadata === 'object'
+      ? campaign.metadata
+      : {};
+  const t = leadStats.totals || {};
+  const sources = (leadStats.bySource || [])
+    .map((s) => `${s.source || 'Unknown'}: ${s.count}`)
+    .join(', ');
+
+  return `You are a sales operations analyst. Write a clear campaign performance report for a sales team.
+
+Campaign name: ${campaign.name || 'Untitled'}
+Platform / channel: ${campaign.platform || 'manual'}
+Status: ${campaign.status || 'unknown'}
+Created: ${campaign.created_at || '—'}
+Description: ${md.description || md.source || 'Not provided'}
+Website: ${md.websiteUrl || '—'}
+
+Lead funnel:
+- Total leads: ${t.total ?? 0}
+- New: ${t.new_leads ?? 0}
+- Interested: ${t.interested ?? 0}
+- Converted: ${t.converted ?? 0}
+- Rejected: ${t.rejected ?? 0}
+- Active in last 7 days: ${t.active_7d ?? 0}
+- Lead sources: ${sources || 'None yet'}
+
+Paid metrics (if any): spend ₹${campaign.spend || 0}, impressions ${campaign.impressions || 0}, clicks ${campaign.clicks || 0}, conversions ${campaign.conversions || 0}
+
+Format the report in markdown with these sections:
+## Executive summary
+## Lead pipeline health
+## What is working
+## Gaps and risks
+## Recommended next actions (numbered, max 6)
+## 7-day action plan
+
+Be specific to the numbers above. If there are zero leads, focus on launch checklist and outreach setup. Keep under 600 words.`;
+}
+
+function buildOfflineSalesCampaignReport(campaign, leadStats) {
+  const t = leadStats.totals || {};
+  const total = Number(t.total) || 0;
+  const converted = Number(t.converted) || 0;
+  const rate = total > 0 ? ((converted / total) * 100).toFixed(1) : '0.0';
+  const name = campaign.name || 'Campaign';
+
+  return `## Executive summary
+**${name}** is **${campaign.status || 'active'}** on **${campaign.platform || 'manual'}** with **${total}** lead(s) in the pipeline. Conversion rate is **${rate}%** (${converted} converted).
+
+## Lead pipeline health
+- New: ${t.new_leads ?? 0} | Interested: ${t.interested ?? 0} | Converted: ${converted} | Rejected: ${t.rejected ?? 0}
+- Active in the last 7 days: ${t.active_7d ?? 0}
+
+## What is working
+${total > 0 ? '- You have started capturing leads — keep logging calls and WhatsApp replies in SalesPal.' : '- Campaign is set up and ready for lead import or outbound.'}
+
+## Gaps and risks
+${total === 0 ? '- No leads yet — add contacts via CSV, manual entry, or connect Facebook/Google lead forms.' : ''}
+${Number(t.interested) > 0 && converted === 0 ? '- Interested leads have not converted — schedule follow-ups within 24 hours.' : ''}
+
+## Recommended next actions
+1. Review all **new** leads and assign first-touch outreach today.
+2. ${total === 0 ? 'Import a lead list or sync from your ad platform.' : 'Prioritize leads with recent activity.'}
+3. Track outcomes (interested / converted / rejected) after each touchpoint.
+4. Run **Analyse** again after 7 days to compare funnel movement.
+
+## 7-day action plan
+| Day | Focus |
+|-----|--------|
+| 1–2 | Contact all new leads |
+| 3–4 | Follow up interested leads |
+| 5–7 | Re-run analysis and adjust messaging |
+
+*This report was generated from your campaign data. AI insights were unavailable; upgrade credits or retry when AI is configured.*`;
+}
+
+/**
  * Build a strategic insights prompt from aggregate analytics.
  */
 function buildStrategicInsightsPrompt(analyticsData) {
@@ -546,6 +627,8 @@ module.exports = {
   buildWhatsAppSystemPrompt,
   systemPromptForChat,
   buildCampaignAnalysisPrompt,
+  buildSalesCampaignReportPrompt,
+  buildOfflineSalesCampaignReport,
   buildStrategicInsightsPrompt,
   callAI,
   callAIWithMessages,

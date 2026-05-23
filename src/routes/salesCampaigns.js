@@ -8,6 +8,9 @@ const router = Router();
 router.use(requireAuth);
 
 router.post('/create', uploadSingle, salesCampaignsController.createSalesCampaign);
+router.get('/analyze/status', salesCampaignsController.getCampaignAnalyzeStatus);
+router.get('/:id/analyze/status', salesCampaignsController.getCampaignAnalyzeStatus);
+router.post('/:id/analyze', uploadNone, salesCampaignsController.analyzeCampaignReport);
 router.get('/:id/leads', salesCampaignsController.getCampaignLeads);
 router.post('/:id/leads', uploadNone, salesCampaignsController.addCampaignLead);
 router.post('/:id/website', uploadNone, salesCampaignsController.saveCampaignWebsite);

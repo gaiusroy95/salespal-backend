@@ -1,5 +1,66 @@
 const db = require('../config/db');
 const leadUploadService = require('../services/leadUpload.service');
+const aiService = require('../services/ai.service');
+const creditService = require('../services/credit.service');
+const { isPlatformAdmin } = require('../utils/adminBypass');
+
+const CAMPAIGN_REPORT_CREDIT_COST = 5;
+const CAMPAIGN_REPORT_REF = 'campaign_report';
+
+async function countOrgCampaignReports(orgId) {
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS n FROM credit_transactions
+     WHERE org_id = $1 AND reference_type = $2`,
+    [orgId, CAMPAIGN_REPORT_REF]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+async function recordCampaignReportUsage(orgId, userId, { free, campaignId }) {
+  const balance = await creditService.getBalance(orgId);
+  const description = free
+    ? `Campaign analysis report (free) — campaign ${campaignId}`
+    : `Campaign analysis report — campaign ${campaignId}`;
+  await db.query(
+    `INSERT INTO credit_transactions
+       (org_id, user_id, amount, type, balance_after, reference_type, reference_id, description)
+     VALUES ($1, $2, $3, 'debit', $4, $5, $6, $7)`,
+    [
+      orgId,
+      userId,
+      free ? 0 : CAMPAIGN_REPORT_CREDIT_COST,
+      balance,
+      CAMPAIGN_REPORT_REF,
+      campaignId,
+      description,
+    ]
+  );
+}
+
+async function getCampaignLeadStats(campaignId, orgId) {
+  const { rows: totalRows } = await db.query(
+    `SELECT
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE status = 'converted')::int AS converted,
+       COUNT(*) FILTER (WHERE status = 'interested')::int AS interested,
+       COUNT(*) FILTER (WHERE status = 'new')::int AS new_leads,
+       COUNT(*) FILTER (WHERE status = 'called')::int AS called,
+       COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected,
+       COUNT(*) FILTER (WHERE last_activity > NOW() - INTERVAL '7 days')::int AS active_7d
+     FROM campaign_leads
+     WHERE campaign_id = $1 AND org_id = $2`,
+    [campaignId, orgId]
+  );
+  const { rows: bySource } = await db.query(
+    `SELECT COALESCE(NULLIF(TRIM(source), ''), 'Unknown') AS source, COUNT(*)::int AS count
+     FROM campaign_leads
+     WHERE campaign_id = $1 AND org_id = $2
+     GROUP BY 1
+     ORDER BY count DESC`,
+    [campaignId, orgId]
+  );
+  return { totals: totalRows[0] || {}, bySource };
+}
 
 async function getOrgId(userId) {
   const { rows } = await db.query(
@@ -56,6 +117,147 @@ exports.createSalesCampaign = async (req, res, next) => {
     );
 
     res.status(201).json({ campaign: rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getCampaignAnalyzeStatus = async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId || (await getOrgId(req.user.id));
+    if (!orgId) {
+      return res.json({
+        freeReportAvailable: true,
+        reportsUsed: 0,
+        creditCost: CAMPAIGN_REPORT_CREDIT_COST,
+      });
+    }
+
+    const reportsUsed = await countOrgCampaignReports(orgId);
+    const isAdmin = isPlatformAdmin(req.user);
+
+    res.json({
+      freeReportAvailable: reportsUsed === 0 || isAdmin,
+      reportsUsed,
+      creditCost: CAMPAIGN_REPORT_CREDIT_COST,
+      adminBypass: isAdmin,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.analyzeCampaignReport = async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId || (await getOrgId(req.user.id));
+    if (!orgId) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'User has no organization' },
+      });
+    }
+
+    const campaignId = req.params.id;
+    const canUse = await ensureCampaignInOrg(campaignId, orgId);
+    if (!canUse) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+    }
+
+    const { rows } = await db.query(
+      `SELECT * FROM campaigns WHERE id = $1 AND org_id = $2 LIMIT 1`,
+      [campaignId, orgId]
+    );
+    const campaign = rows[0];
+    if (!campaign) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Campaign not found' } });
+    }
+
+    const isAdmin = isPlatformAdmin(req.user);
+    const reportsUsed = await countOrgCampaignReports(orgId);
+    const isFree = reportsUsed === 0;
+
+    if (!isAdmin && !isFree) {
+      await creditService.ensureCreditsRow(orgId, req.user.id);
+      const ok = await creditService.consumeCredits(
+        orgId,
+        CAMPAIGN_REPORT_CREDIT_COST,
+        CAMPAIGN_REPORT_REF,
+        `Campaign analysis report — ${campaign.name || campaignId}`,
+        req.user.id
+      );
+      if (!ok) {
+        return res.status(402).json({
+          error: {
+            code: 'INSUFFICIENT_CREDITS',
+            message: `Not enough credits. Each report after your first free one costs ${CAMPAIGN_REPORT_CREDIT_COST} credits.`,
+            creditCost: CAMPAIGN_REPORT_CREDIT_COST,
+          },
+        });
+      }
+    }
+
+    const leadStats = await getCampaignLeadStats(campaignId, orgId);
+    const prompt = aiService.buildSalesCampaignReportPrompt(campaign, leadStats);
+
+    let report;
+    let fallback = false;
+    let fallbackReason = null;
+
+    try {
+      if (isAdmin) {
+        const skip = new Error('admin_bypass');
+        skip.code = 'ADMIN_SKIP_GEMINI';
+        throw skip;
+      }
+      report = await aiService.callAI(prompt);
+    } catch (aiErr) {
+      fallback = true;
+      fallbackReason =
+        aiErr?.code === 'ADMIN_SKIP_GEMINI'
+          ? 'admin_usage_bypass'
+          : aiErr?.code || 'ai_unavailable';
+      report = aiService.buildOfflineSalesCampaignReport(campaign, leadStats);
+    }
+
+    if (!isAdmin) {
+      await recordCampaignReportUsage(orgId, req.user.id, {
+        free: isFree,
+        campaignId,
+      });
+    }
+
+    const generatedAt = new Date().toISOString();
+    await db.query(
+      `UPDATE campaigns
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb, updated_at = NOW()
+       WHERE id = $2 AND org_id = $3`,
+      [
+        JSON.stringify({
+          last_analysis_report: {
+            generatedAt,
+            fallback,
+            report: report.slice(0, 12000),
+          },
+        }),
+        campaignId,
+        orgId,
+      ]
+    );
+
+    res.json({
+      campaignId,
+      campaignName: campaign.name,
+      report,
+      generatedAt,
+      fallback,
+      fallbackReason,
+      billing: {
+        free: isFree && !isAdmin,
+        creditsCharged: !isAdmin && !isFree ? CAMPAIGN_REPORT_CREDIT_COST : 0,
+        reportsUsedAfter: isAdmin ? reportsUsed : reportsUsed + 1,
+        nextReportCreditCost: CAMPAIGN_REPORT_CREDIT_COST,
+      },
+      stats: leadStats,
+    });
   } catch (err) {
     next(err);
   }
